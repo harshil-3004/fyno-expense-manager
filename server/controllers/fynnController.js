@@ -157,6 +157,69 @@ const checkIdempotency = asyncHandler(async (req, res) => {
   });
 });
 
+// @desc    Get all user memories
+// @route   GET /api/fynn/memory
+// @access  Private
+const getFynnMemories = asyncHandler(async (req, res) => {
+  const userId = req.user._id;
+  const FynnMemory = require('../models/FynnMemory');
+  const memories = await FynnMemory.find({ userId }).sort({ createdAt: -1 });
+  res.json(memories);
+});
+
+// @desc    Update a specific memory's value
+// @route   PUT /api/fynn/memory/:id
+// @access  Private
+const updateFynnMemory = asyncHandler(async (req, res) => {
+  const userId = req.user._id;
+  const { id } = req.params;
+  const { value } = req.body;
+
+  if (!value || value.trim() === '') {
+    return res.status(400).json({ message: 'Value is required' });
+  }
+
+  const FynnMemory = require('../models/FynnMemory');
+  const memory = await FynnMemory.findOneAndUpdate(
+    { _id: id, userId },
+    { value: value.trim() },
+    { new: true }
+  );
+
+  if (!memory) {
+    return res.status(404).json({ message: 'Memory not found' });
+  }
+
+  res.json(memory);
+});
+
+// @desc    Delete a specific memory
+// @route   DELETE /api/fynn/memory/:id
+// @access  Private
+const deleteFynnMemory = asyncHandler(async (req, res) => {
+  const userId = req.user._id;
+  const { id } = req.params;
+
+  const FynnMemory = require('../models/FynnMemory');
+  const memory = await FynnMemory.findOneAndDelete({ _id: id, userId });
+
+  if (!memory) {
+    return res.status(404).json({ message: 'Memory not found' });
+  }
+
+  res.json({ message: 'Memory deleted successfully' });
+});
+
+// @desc    Clear all memories for the user
+// @route   DELETE /api/fynn/memory
+// @access  Private
+const clearFynnMemories = asyncHandler(async (req, res) => {
+  const userId = req.user._id;
+  const FynnMemory = require('../models/FynnMemory');
+  await FynnMemory.deleteMany({ userId });
+  res.json({ message: 'All memories deleted successfully' });
+});
+
 module.exports = {
   getFynnSummary,
   getFynnSpending,
@@ -170,4 +233,8 @@ module.exports = {
   getMonthlyReview,
   clearFynnHistory,
   checkIdempotency,
+  getFynnMemories,
+  updateFynnMemory,
+  deleteFynnMemory,
+  clearFynnMemories,
 };

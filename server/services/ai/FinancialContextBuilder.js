@@ -47,6 +47,7 @@ class FinancialContextBuilder {
    * Internal method to pull and aggregate MongoDB records
    */
   async _gatherContext(userId) {
+    console.log('QUERY START');
     const currentDate = new Date();
     const currentMonth = currentDate.getMonth() + 1;
     const currentYear = currentDate.getFullYear();
@@ -120,6 +121,9 @@ class FinancialContextBuilder {
     // 7. Get spending comparison to last month
     const comparison = await smartInsightsService.getMonthlyComparison(userId);
 
+    const resultCount = 1 + 1 + 1 + 1 + 1 + goals.length + budgets.length + categorySpending.length + 1;
+    console.log('QUERY RESULT COUNT', resultCount);
+
     return {
       monthlyIncome,
       monthlyExpense,
@@ -135,6 +139,16 @@ class FinancialContextBuilder {
         lastTotal: comparison.lastTotal,
         percentChange: comparison.percentChange,
         direction: comparison.direction
+      },
+      categorySpending: {
+        food: spentMap['food'] || 0,
+        travel: spentMap['travel'] || 0,
+        shopping: spentMap['shopping'] || 0,
+        bills: spentMap['bills'] || 0,
+        entertainment: spentMap['entertainment'] || 0,
+        health: spentMap['health'] || 0,
+        education: spentMap['education'] || 0,
+        other: spentMap['other'] || 0
       }
     };
   }

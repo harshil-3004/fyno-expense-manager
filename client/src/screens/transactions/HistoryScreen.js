@@ -1,15 +1,16 @@
-import React, { useEffect, useState, useCallback } from 'react';
-import { View, Text, FlatList, Pressable, TextInput, RefreshControl, StyleSheet, Modal, ScrollView } from 'react-native';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import { View, Text, SectionList, Pressable, TextInput, RefreshControl, StyleSheet, Modal, ScrollView } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../theme';
 import { useDispatch, useSelector } from 'react-redux';
 import { fetchExpenses } from '../../redux/slices/expenseSlice';
 import { fetchIncomes } from '../../redux/slices/incomeSlice';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import TransactionCard from '../../components/transactions/TransactionCard';
-import EmptyState from '../../components/ui/EmptyState';
-import { EMPTY_STATES } from '../../constants/emptyStates';
 import { CATEGORIES } from '../../constants/categories';
+import { groupTransactionsByDate } from '../../utils/groupTransactionsByDate';
+import TimelineSectionHeader from '../../components/history/TimelineSectionHeader';
+import TimelineTransactionCard from '../../components/history/TimelineTransactionCard';
+import TimelineEmptyState from '../../components/history/TimelineEmptyState';
 
 const HistoryScreen = ({ navigation }) => {
   const { colors, spacing, typography, fontSize, borderRadius } = useTheme();
@@ -48,26 +49,33 @@ const HistoryScreen = ({ navigation }) => {
   }, [dispatch, sortBy, selectedCategories]);
 
   // Merge and sort transactions
-  let transactions = [];
-  if (activeFilter === 'all' || activeFilter === 'expense') {
-    let filteredExpenses = expenses.items;
-    if (selectedCategories.length > 0) {
-      filteredExpenses = filteredExpenses.filter((e) => selectedCategories.includes(e.category));
+  const transactions = useMemo(() => {
+    let merged = [];
+    if (activeFilter === 'all' || activeFilter === 'expense') {
+      let filteredExpenses = expenses.items;
+      if (selectedCategories.length > 0) {
+        filteredExpenses = filteredExpenses.filter((e) => selectedCategories.includes(e.category));
+      }
+      merged = [...merged, ...filteredExpenses.map((e) => ({ ...e, type: 'expense' }))];
     }
-    transactions = [...transactions, ...filteredExpenses.map((e) => ({ ...e, type: 'expense' }))];
-  }
-  if ((activeFilter === 'all' || activeFilter === 'income') && selectedCategories.length === 0) {
-    transactions = [...transactions, ...income.items.map((i) => ({ ...i, type: 'income', title: i.sourceName }))];
-  }
+    if ((activeFilter === 'all' || activeFilter === 'income') && selectedCategories.length === 0) {
+      merged = [...merged, ...income.items.map((i) => ({ ...i, type: 'income', title: i.sourceName }))];
+    }
 
-  // Sort
-  transactions.sort((a, b) => {
-    if (sortBy === '-date') return new Date(b.date) - new Date(a.date);
-    if (sortBy === 'date') return new Date(a.date) - new Date(b.date);
-    if (sortBy === '-amount') return b.amount - a.amount;
-    if (sortBy === 'amount') return a.amount - b.amount;
-    return 0;
-  });
+    // Sort
+    merged.sort((a, b) => {
+      if (sortBy === '-date') return new Date(b.date) - new Date(a.date);
+      if (sortBy === 'date') return new Date(a.date) - new Date(b.date);
+      if (sortBy === '-amount') return b.amount - a.amount;
+      if (sortBy === 'amount') return a.amount - b.amount;
+      return 0;
+    });
+
+    return merged;
+  }, [expenses.items, income.items, activeFilter, selectedCategories, sortBy]);
+
+  // Group into timeline sections
+  const sections = useMemo(() => groupTransactionsByDate(transactions), [transactions]);
 
   const currency = user?.currency || 'INR';
   const loading = expenses.loading || income.loading;
@@ -85,13 +93,50 @@ const HistoryScreen = ({ navigation }) => {
     { id: 'amount', label: 'Lowest' },
   ];
 
+  const handleTransactionPress = useCallback((t) => {
+    navigation.navigate('TransactionDetail', { transaction: t });
+  }, [navigation]);
+
+  const renderSectionHeader = useCallback(({ section }) => (
+    <TimelineSectionHeader
+      title={section.title}
+      subtitle={section.subtitle}
+      count={section.count}
+      totalExpense={section.totalExpense}
+      totalIncome={section.totalIncome}
+      currency={currency}
+    />
+  ), [currency]);
+
+  const renderItem = useCallback(({ item, index }) => (
+    <TimelineTransactionCard
+      transaction={item}
+      currency={currency}
+      onPress={handleTransactionPress}
+      index={index}
+    />
+  ), [currency, handleTransactionPress]);
+
+  const renderEmpty = useCallback(() => {
+    if (loading) return null;
+    return <TimelineEmptyState />;
+  }, [loading]);
+
+  const keyExtractor = useCallback((item) => item._id, []);
+
   return (
     <View style={[styles.container, { backgroundColor: colors.background, paddingTop: insets.top }]}>
       {/* Header */}
-      <View style={[styles.header, { paddingHorizontal: spacing.xl, paddingVertical: spacing.base }]}>
+      <View style={[styles.header, { paddingHorizontal: spacing.xl, paddingVertical: spacing.base, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }]}>
         <Text style={{ fontFamily: typography.h2.fontFamily, fontSize: fontSize['2xl'], color: colors.textPrimary }}>
           History
         </Text>
+        <Pressable 
+          onPress={() => navigation.navigate('ExportScreen', { filteredTransactions: transactions })}
+          style={({ pressed }) => [{ opacity: pressed ? 0.7 : 1, padding: 4, backgroundColor: colors.surfaceElevated, borderRadius: borderRadius.full }]}
+        >
+          <Ionicons name="download-outline" size={22} color={colors.textPrimary} style={{ padding: 8 }} />
+        </Pressable>
       </View>
 
       {/* Search */}
@@ -137,7 +182,6 @@ const HistoryScreen = ({ navigation }) => {
               key={f.id}
               onPress={() => {
                 setActiveFilter(f.id);
-                // Reset category filter if switching to income since income has no category
                 if (f.id === 'income') setSelectedCategories([]);
               }}
               style={[
@@ -261,9 +305,7 @@ const HistoryScreen = ({ navigation }) => {
                 })}
               </View>
 
-
-
-              {/* Category Section (only show if active filter is 'all' or 'expense') */}
+              {/* Category Section */}
               {(activeFilter === 'all' || activeFilter === 'expense') && (
                 <>
                   <Text style={[styles.sectionTitleText, { color: colors.textMuted, fontFamily: typography.captionMedium.fontFamily, fontSize: fontSize.xs, marginTop: spacing.lg }]}>
@@ -321,28 +363,27 @@ const HistoryScreen = ({ navigation }) => {
         </Pressable>
       </Modal>
 
-      {/* List */}
-      <FlatList
-        data={transactions}
-        keyExtractor={(item) => item._id}
-        renderItem={({ item }) => (
-          <TransactionCard
-            transaction={item}
-            currency={currency}
-            onPress={(t) => navigation.navigate('TransactionDetail', { transaction: t })}
+      {/* Timeline SectionList */}
+      <SectionList
+        sections={sections}
+        keyExtractor={keyExtractor}
+        renderSectionHeader={renderSectionHeader}
+        renderItem={renderItem}
+        ListEmptyComponent={renderEmpty}
+        stickySectionHeadersEnabled={true}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            tintColor={colors.accent}
+            colors={[colors.accent]}
           />
-        )}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.accent} colors={[colors.accent]} />}
-        ListEmptyComponent={
-          !loading ? (
-            <EmptyState
-              emoji={EMPTY_STATES.history.emoji}
-              title={search ? EMPTY_STATES.search.title : EMPTY_STATES.history.title}
-              subtitle={search ? EMPTY_STATES.search.subtitle : EMPTY_STATES.history.subtitle}
-            />
-          ) : null
         }
         contentContainerStyle={{ flexGrow: 1, paddingBottom: spacing['5xl'] }}
+        showsVerticalScrollIndicator={false}
+        initialNumToRender={15}
+        maxToRenderPerBatch={10}
+        windowSize={7}
       />
     </View>
   );
@@ -354,7 +395,6 @@ const styles = StyleSheet.create({
   searchContainer: {},
   searchBar: { flexDirection: 'row', alignItems: 'center', height: 46 },
   searchInput: { flex: 1, marginLeft: 8, height: '100%' },
-  filters: { flexDirection: 'row', alignItems: 'center' },
   filterChip: {},
   sortBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
   modalOverlay: {

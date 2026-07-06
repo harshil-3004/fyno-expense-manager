@@ -53,7 +53,7 @@ class FynnAIService {
    * Helper to write a single transaction document into MongoDB and verify it
    */
   async _saveTransaction(userId, type, amount, category, description, confidence = 1.0, date = null, session = null) {
-    console.log('[INSERT STARTED]', { userId, type, amount, category, description, date, hasSession: !!session });
+    console.log('INSERT START');
     try {
       let savedDoc;
       const saveOpts = session ? { session } : {};
@@ -81,7 +81,6 @@ class FynnAIService {
 
         const expense = new Expense(expenseData);
         savedDoc = await expense.save(saveOpts);
-        console.log('[STAGE] Expense created: description="' + description + '", amount=' + amount);
 
         // Verification check: Read the inserted row back from the database
         const verified = await Expense.findOne({ _id: savedDoc._id, userId }).session(session ? session : null);
@@ -112,7 +111,6 @@ class FynnAIService {
 
         const income = new Income(incomeData);
         savedDoc = await income.save(saveOpts);
-        console.log('[STAGE] Income created: description="' + description + '", amount=' + amount);
 
         // Verification check: Read the inserted row back from the database
         const verified = await Income.findOne({ _id: savedDoc._id, userId }).session(session ? session : null);
@@ -121,7 +119,7 @@ class FynnAIService {
         }
       }
 
-      console.log('[INSERT SUCCESS]', JSON.stringify(savedDoc));
+      console.log('INSERT COMPLETE');
       return savedDoc;
     } catch (error) {
       console.error('[INSERT FAILED]', error.message);
@@ -307,6 +305,19 @@ class FynnAIService {
           console.error('Idempotency save error:', err.message);
         }
       }
+
+      // Asynchronously trigger memory detection & habit analysis
+      if (resBody && resBody.intent !== 'error' && resBody.intent !== 'fallback') {
+        const MemoryDetectionService = require('./MemoryDetectionService');
+        MemoryDetectionService.detectAndSave(userId, message).catch(err => {
+          console.error('[FynnAIService] Background memory detection error:', err.message);
+        });
+
+        this._triggerBackgroundHabitAnalysis(userId).catch(err => {
+          console.error('[FynnAIService] Background habit analysis trigger error:', err.message);
+        });
+      }
+
       console.log('[STAGE] Response sent: response="' + resBody.response + '"');
       return resBody;
     };
@@ -322,6 +333,11 @@ class FynnAIService {
 
       const currencySymbol = await this._getCurrencySymbol(userId);
       const context = await FinancialContextBuilder.buildContext(userId);
+
+      // Search and retrieve relevant memories/habits
+      const MemorySearchService = require('./MemorySearchService');
+      context.relevantMemories = await MemorySearchService.search(userId, message);
+
       const userIdStr = userId.toString();
 
       // 3. Resolve Conversation State First (ConversationStateManager)
@@ -442,7 +458,10 @@ class FynnAIService {
                 if (checkInc.length > 0) throw new Error("Verification failed: deleted incomes still in DB");
               }
 
-              if (useTransaction && session) await session.commitTransaction();
+              if (useTransaction && session) {
+                await session.commitTransaction();
+                console.log('COMMIT COMPLETE');
+              }
 
               // Clear state and cache lastTransactionId if it was deleted
               let fynnState = await FynnState.findOne({ userId });
@@ -459,6 +478,8 @@ class FynnAIService {
               }
 
               FinancialContextBuilder.invalidateCache(userId);
+              await FinancialContextBuilder.buildContext(userId);
+              console.log('CACHE REFRESH COMPLETE');
 
               // Dynamically build success response based on actual deletion metrics
               const deletedExpenses = matches.filter(m => m.type === 'expense').length;
@@ -526,7 +547,10 @@ class FynnAIService {
             try {
               const updated = await CrudExecutor.update(userId, matches, changes, useTransaction ? session : null);
               
-              if (useTransaction && session) await session.commitTransaction();
+              if (useTransaction && session) {
+                await session.commitTransaction();
+                console.log('COMMIT COMPLETE');
+              }
 
               if (updated.length > 0) {
                 const lastDoc = updated[updated.length - 1];
@@ -544,6 +568,8 @@ class FynnAIService {
               }
 
               FinancialContextBuilder.invalidateCache(userId);
+              await FinancialContextBuilder.buildContext(userId);
+              console.log('CACHE REFRESH COMPLETE');
               const responseText = "Expense updated successfully.";
               const context = await FinancialContextBuilder.buildContext(userId);
               return await saveToIdempotency({
@@ -630,7 +656,10 @@ class FynnAIService {
 
               try {
                 const duplicated = await CrudExecutor.duplicate(userId, [chosenMatch], useTransaction ? session : null);
-                if (useTransaction && session) await session.commitTransaction();
+                if (useTransaction && session) {
+                  await session.commitTransaction();
+                  console.log('COMMIT COMPLETE');
+                }
 
                 if (duplicated.length > 0) {
                   const lastDoc = duplicated[0];
@@ -648,6 +677,8 @@ class FynnAIService {
                 }
 
                 FinancialContextBuilder.invalidateCache(userId);
+                await FinancialContextBuilder.buildContext(userId);
+                console.log('CACHE REFRESH COMPLETE');
                 return await saveToIdempotency({
                   response: "Expense duplicated successfully.",
                   intent: 'transaction_added'
@@ -691,7 +722,10 @@ class FynnAIService {
                 useTransaction ? session : null
               );
 
-              if (useTransaction && session) await session.commitTransaction();
+              if (useTransaction && session) {
+                await session.commitTransaction();
+                console.log('COMMIT COMPLETE');
+              }
 
               await FynnState.findOneAndUpdate(
                 { userId },
@@ -706,6 +740,8 @@ class FynnAIService {
               );
 
               FinancialContextBuilder.invalidateCache(userId);
+              await FinancialContextBuilder.buildContext(userId);
+              console.log('CACHE REFRESH COMPLETE');
 
               // Generate factual response
               const responseText = `Done! Added ${currencySymbol}${doc.amount.toLocaleString()} under ${doc.category.charAt(0).toUpperCase() + doc.category.slice(1)} for "${doc.title || doc.sourceName}".`;
@@ -751,7 +787,10 @@ class FynnAIService {
                 useTransaction ? session : null
               );
 
-              if (useTransaction && session) await session.commitTransaction();
+              if (useTransaction && session) {
+                await session.commitTransaction();
+                console.log('COMMIT COMPLETE');
+              }
 
               await FynnState.findOneAndUpdate(
                 { userId },
@@ -766,6 +805,8 @@ class FynnAIService {
               );
 
               FinancialContextBuilder.invalidateCache(userId);
+              await FinancialContextBuilder.buildContext(userId);
+              console.log('CACHE REFRESH COMPLETE');
 
               const responseText = `Done! Added ${currencySymbol}${doc.amount.toLocaleString()} under ${doc.category.charAt(0).toUpperCase() + doc.category.slice(1)} for "${doc.title || doc.sourceName}".`;
               return await saveToIdempotency({
@@ -894,7 +935,7 @@ class FynnAIService {
 
           if (useTransaction && session) {
             await session.commitTransaction();
-            console.log('[STAGE] DB Transaction commit success');
+            console.log('COMMIT COMPLETE');
           }
         } catch (err) {
           console.error('[ERROR] Name:', err.name);
@@ -931,6 +972,8 @@ class FynnAIService {
         }
 
         FinancialContextBuilder.invalidateCache(userId);
+        await FinancialContextBuilder.buildContext(userId);
+        console.log('CACHE REFRESH COMPLETE');
 
         const details = insertedDocs.map(d => ({
           type: d.title !== undefined ? 'expense' : 'income',
@@ -1170,7 +1213,10 @@ class FynnAIService {
             allDuplicatedDocs.push(...duplicated);
           }
 
-          if (useTransaction && session) await session.commitTransaction();
+          if (useTransaction && session) {
+            await session.commitTransaction();
+            console.log('COMMIT COMPLETE');
+          }
         } catch (err) {
           if (useTransaction && session) await session.abortTransaction();
           return await saveToIdempotency({
@@ -1196,8 +1242,10 @@ class FynnAIService {
           );
         }
 
+        FinancialContextBuilder.invalidateCache(userId);
         const responseText = "Expense duplicated successfully.";
         const context = await FinancialContextBuilder.buildContext(userId);
+        console.log('CACHE REFRESH COMPLETE');
         return await saveToIdempotency({
           success: true,
           message: responseText,
@@ -1331,6 +1379,33 @@ class FynnAIService {
     } catch (error) {
       console.error('FynnAIService Error generating monthly review:', error);
       return this._getMonthlyReviewFallback();
+    }
+  }
+
+  /**
+   * Fallback object for weekly review
+   */
+  async _triggerBackgroundHabitAnalysis(userId) {
+    try {
+      const FynnState = require('../../models/FynnState');
+      let state = await FynnState.findOne({ userId });
+      if (!state) {
+        state = await FynnState.create({ userId });
+      }
+
+      const now = Date.now();
+      const twentyFourHours = 24 * 60 * 60 * 1000;
+      if (!state.lastHabitAnalysisAt || (now - new Date(state.lastHabitAnalysisAt).getTime() > twentyFourHours)) {
+        state.lastHabitAnalysisAt = new Date();
+        await state.save();
+
+        const HabitAnalyzerService = require('./HabitAnalyzerService');
+        HabitAnalyzerService.analyze(userId).catch(err => {
+          console.error('[FynnAIService] Background habit analysis error:', err.message);
+        });
+      }
+    } catch (err) {
+      console.error('[FynnAIService] Failed to trigger background analysis:', err.message);
     }
   }
 

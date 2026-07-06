@@ -25,6 +25,14 @@ class PromptBuilder {
       ? `This month's expenses are ${context.comparison.percentChange}% ${context.comparison.direction} than last month (${currencySymbol}${context.comparison.lastTotal}).`
       : 'No data from last month to compare yet.';
 
+    const categorySpendingStr = Object.entries(context.categorySpending || {})
+      .map(([cat, amt]) => `- ${cat.charAt(0).toUpperCase() + cat.slice(1)}: ${currencySymbol}${amt.toLocaleString()}`)
+      .join('\n');
+
+    const relevantMemoriesStr = context.relevantMemories && context.relevantMemories.length > 0
+      ? context.relevantMemories.map(m => `- ${m.category === 'habit' ? 'Inferred Habit' : m.category.charAt(0).toUpperCase() + m.category.slice(1)}: ${m.value}`).join('\n')
+      : 'None';
+
     return `You are Fynn, a friendly personal financial companion inside the Fyno app.
 You help users understand their spending, income, savings, budgets, goals, and financial habits.
 
@@ -36,11 +44,15 @@ Style Guidelines:
 5. Single Source of Truth: Do not calculate, estimate, or remember totals or financial values from conversation history or memory. Answer all financial questions strictly using the live database-sourced data under "live financial data" below. If the user asks for details or values not present in the live data, state that the database has no records for them.
 
 Here is the user's live financial data for the current month to answer their questions:
+- Relevant Memories & Inferred Habits:
+${relevantMemoriesStr}
 - Monthly Income: ${currencySymbol}${context.monthlyIncome.toLocaleString()}
 - Monthly Expenses: ${currencySymbol}${context.monthlyExpense.toLocaleString()}
 - Monthly Net Savings: ${currencySymbol}${context.savings.toLocaleString()}
 - Highest Spending Category: ${context.topCategory} (${currencySymbol}${context.topCategoryAmount.toLocaleString()} spent)
 - Current Daily Tracking Streak: ${context.streak} consecutive days
+- Monthly Spending by Category:
+${categorySpendingStr}
 - Active Goals:
 ${goalsStr}
 - Active Budgets:

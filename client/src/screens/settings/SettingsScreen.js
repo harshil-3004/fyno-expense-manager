@@ -287,6 +287,15 @@ const SettingsScreen = ({ navigation }) => {
               setShowCurrency(true);
             }}
           />
+          <SettingRow
+            icon="download-outline"
+            iconBg="#14b8a6"
+            title="Export Data"
+            subtitle="Download PDF or CSV report"
+            onPress={() => {
+              navigation.navigate('ExportScreen');
+            }}
+          />
         </SettingsGroup>
 
         {/* Preferences Group */}

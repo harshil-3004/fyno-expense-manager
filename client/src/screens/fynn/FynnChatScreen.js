@@ -541,7 +541,11 @@ const FynnChatScreen = () => {
       </KeyboardAvoidingView>
       <VoiceAssistantOverlay
         visible={voiceOverlayVisible}
-        onClose={() => setVoiceOverlayVisible(false)}
+        onClose={() => {
+          console.trace('[Overlay Closing] Reason: Parent onClose callback');
+          console.log('[Parent Close] setVoiceOverlayVisible(false) called');
+          setVoiceOverlayVisible(false);
+        }}
         onSendVoiceMessage={handleSendVoiceMessage}
       />
     </View>

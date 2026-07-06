@@ -13,6 +13,10 @@ const {
   getMonthlyReview,
   clearFynnHistory,
   checkIdempotency,
+  getFynnMemories,
+  updateFynnMemory,
+  deleteFynnMemory,
+  clearFynnMemories,
 } = require('../controllers/fynnController');
 
 /**
@@ -32,5 +36,11 @@ router.get('/review/weekly', protect, getWeeklyReview);
 router.get('/review/monthly', protect, getMonthlyReview);
 router.get('/idempotency/:requestId', protect, checkIdempotency);
 router.post('/chat', protect, chatFynn);
+
+// Memory Management APIs
+router.get('/memory', protect, getFynnMemories);
+router.put('/memory/:id', protect, updateFynnMemory);
+router.delete('/memory/:id', protect, deleteFynnMemory);
+router.delete('/memory', protect, clearFynnMemories);
 
 module.exports = router;

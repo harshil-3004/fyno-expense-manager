@@ -33,19 +33,43 @@ const VoiceAssistantOverlay = ({
 
   // Active request ID tracking for dialogue turns
   const currentRequestId = useRef('');
+  const appStateTimeoutRef = useRef(null);
 
   useEffect(() => {
     const handleAppStateChange = (nextAppState) => {
-      if (nextAppState === 'background' || nextAppState === 'inactive') {
-        console.log('[VoiceAssistantOverlay] App minimized. Cleaning up speech resources.');
-        cleanupFlow();
-        onClose();
+      if (nextAppState === 'background') {
+        // Clear any existing timeout
+        if (appStateTimeoutRef.current) {
+          clearTimeout(appStateTimeoutRef.current);
+        }
+
+        console.log('[VoiceAssistantOverlay] App entered background. Starting verification timer...');
+
+        appStateTimeoutRef.current = setTimeout(() => {
+          if (AppState.currentState === 'background') {
+            console.trace('[Overlay Closing] AppState transition to background verified');
+            console.log('[VoiceAssistantOverlay] App genuinely minimized. Cleaning up speech resources.');
+            cleanupFlow();
+            onClose();
+          }
+          appStateTimeoutRef.current = null;
+        }, 2000);
+      } else {
+        // Returned to active or inactive
+        if (appStateTimeoutRef.current) {
+          clearTimeout(appStateTimeoutRef.current);
+          appStateTimeoutRef.current = null;
+          console.log('[VoiceAssistantOverlay] AppState returned from transient background state. Cleanup cancelled.');
+        }
       }
     };
 
     const subscription = AppState.addEventListener('change', handleAppStateChange);
     return () => {
       subscription.remove();
+      if (appStateTimeoutRef.current) {
+        clearTimeout(appStateTimeoutRef.current);
+      }
     };
   }, []);
 
@@ -53,9 +77,13 @@ const VoiceAssistantOverlay = ({
     if (visible) {
       startListeningFlow();
     } else {
+      console.trace('[Overlay Closing] visible prop changed to false');
       cleanupFlow();
     }
-    return () => cleanupFlow();
+    return () => {
+      console.trace('[Overlay Closing] component unmount cleanup');
+      cleanupFlow();
+    };
   }, [visible]);
 
   // Handle visualizer pulse animation
@@ -207,7 +235,7 @@ const VoiceAssistantOverlay = ({
 
       if (result && result.response) {
         setDisplayText(result.response);
-        
+
         // Strip emojis (surrogate pairs and dingbats) to prevent TTS from pronouncing them
         const cleanSpeechText = result.response
           .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')
@@ -228,6 +256,7 @@ const VoiceAssistantOverlay = ({
           },
           (ttsErr) => {
             console.error('[VoiceAssistantOverlay] TTS play failed:', ttsErr);
+            console.trace('[Overlay Closing] Reason: TTS Failure');
             cleanupFlow();
             onClose();
           }
@@ -252,6 +281,7 @@ const VoiceAssistantOverlay = ({
   };
 
   const handleInterrupt = () => {
+    console.trace('[Overlay Closing] Reason: handleInterrupt');
     cleanupFlow();
     onClose();
   };
@@ -311,13 +341,10 @@ const VoiceAssistantOverlay = ({
     hintText = 'Speaking... Tap anywhere to interrupt';
   }
 
+  if (!visible) return null;
+
   return (
-    <Modal
-      transparent={true}
-      visible={visible}
-      animationType="fade"
-      onRequestClose={handleInterrupt}
-    >
+    <View style={styles.absoluteOverlay}>
       <TouchableOpacity
         style={styles.container}
         activeOpacity={1}
@@ -398,11 +425,16 @@ const VoiceAssistantOverlay = ({
           <Text style={styles.hintText}>{hintText}</Text>
         </View>
       </TouchableOpacity>
-    </Modal>
+    </View>
   );
 };
 
 const styles = StyleSheet.create({
+  absoluteOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 9999,
+    elevation: 20,
+  },
   container: {
     flex: 1,
     backgroundColor: 'rgba(10, 10, 14, 0.92)',

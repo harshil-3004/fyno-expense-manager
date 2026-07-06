@@ -9,6 +9,10 @@ const fynnStateSchema = new mongoose.Schema(
       unique: true,
       index: true,
     },
+    lastHabitAnalysisAt: {
+      type: Date,
+      required: false,
+    },
     lastTransactionId: {
       type: mongoose.Schema.Types.ObjectId,
       required: false,

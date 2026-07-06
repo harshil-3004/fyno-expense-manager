@@ -441,6 +441,36 @@ async function runTests() {
     const finalCountTest11 = await Expense.countDocuments({ userId });
     await assert(finalCountTest11 === startCountTest11 + 1, "Only one transaction created, preventing duplicates on double-click");
 
+    // ==========================================
+    // Test 12: Read-After-Write Consistency Regression Test
+    // ==========================================
+    console.log('\n--- Running Test 12: Read-After-Write Consistency Regression ---');
+    
+    setMockStructured('create_transactions', {
+      transactions: [{
+        type: 'expense',
+        amount: 200,
+        category: 'Food',
+        description: 'vegetables',
+        date: null
+      }]
+    });
+
+    const addResult = await fynnAIService.generateResponse(userId, "Add ₹200 vegetables", "req_id_test12_add");
+    await assert(addResult.success === true, "Transaction added successfully");
+
+    const FinancialContextBuilder = require('../services/ai/FinancialContextBuilder');
+    const PromptBuilder = require('../services/ai/PromptBuilder');
+    
+    const postAddContext = await FinancialContextBuilder.buildContext(userId);
+    
+    const foodSpend = postAddContext.categorySpending?.food || 0;
+    await assert(foodSpend >= 200, "Food category spending immediately includes the ₹200");
+
+    const sysInstruction = PromptBuilder.getChatSystemInstruction(postAddContext, '₹');
+    await assert(sysInstruction.includes('Food: ₹'), "System instruction includes category spending information");
+    await assert(sysInstruction.includes('Food: ₹' + foodSpend.toLocaleString()), "System instruction contains the exact updated food spending");
+
     console.log('\n==========================================');
     console.log(`ALL TESTS COMPLETE!`);
     console.log(`Passed: ${testsPassed}`);
@@ -451,6 +481,8 @@ async function runTests() {
     console.error('\nTest runner failed with exception:', err);
     testsFailed++;
   } finally {
+    // Wait for any background async tasks to settle
+    await new Promise(resolve => setTimeout(resolve, 500));
     await mongoose.disconnect();
     process.exit(testsFailed > 0 ? 1 : 0);
   }

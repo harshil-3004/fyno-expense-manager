@@ -22,6 +22,7 @@ import PrivacyScreen from '../screens/settings/PrivacyScreen';
 import AboutScreen from '../screens/settings/AboutScreen';
 import BudgetScreen from '../screens/plan/BudgetScreen';
 import GoalScreen from '../screens/plan/GoalScreen';
+import ExportScreen from '../screens/settings/ExportScreen';
 
 const Tab = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
@@ -158,6 +159,7 @@ const FynnPrivacy = withFynn(PrivacyScreen);
 const FynnAbout = withFynn(AboutScreen);
 const FynnBudget = withFynn(BudgetScreen);
 const FynnGoal = withFynn(GoalScreen);
+const FynnExport = withFynn(ExportScreen);
 
 const MainNavigator = () => {
   return (
@@ -217,6 +219,11 @@ const MainNavigator = () => {
         <Stack.Screen
           name="GoalScreen"
           component={FynnGoal}
+          options={{ animation: 'slide_from_right' }}
+        />
+        <Stack.Screen
+          name="ExportScreen"
+          component={FynnExport}
           options={{ animation: 'slide_from_right' }}
         />
       </Stack.Navigator>

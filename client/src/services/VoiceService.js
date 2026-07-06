@@ -40,6 +40,8 @@ class VoiceService {
     this.pauseTimer = null;
     this.maxDurationTimer = null;
     this.lastTranscript = '';
+    this.finalTranscript = '';
+    this.currentInterimTranscript = '';
     this.hasFinalized = false;
 
     // Subscriptions array for native event listeners
@@ -102,30 +104,77 @@ class VoiceService {
     }
   }
 
+  _trimOverlap(accumulated, next) {
+    const accWords = accumulated.trim().split(/\s+/);
+    const nextWords = next.trim().split(/\s+/);
+
+    if (accWords.length === 0 || accWords[0] === "") return next;
+    if (nextWords.length === 0 || nextWords[0] === "") return next;
+
+    let maxOverlap = 0;
+    const limit = Math.min(accWords.length, nextWords.length);
+
+    for (let i = 1; i <= limit; i++) {
+      const suffix = accWords.slice(accWords.length - i).join(' ').toLowerCase();
+      const prefix = nextWords.slice(0, i).join(' ').toLowerCase();
+
+      if (suffix === prefix) {
+        maxOverlap = i;
+      }
+    }
+
+    if (maxOverlap > 0) {
+      return nextWords.slice(maxOverlap).join(' ');
+    }
+    return next;
+  }
+
   _handleSpeechEvent(event) {
     if (this.hasFinalized) return;
 
-    let finalTranscript = '';
-    let interimTranscript = '';
-    
+    let eventFinals = [];
+    let eventInterim = '';
+
     if (event && event.results) {
       for (let i = 0; i < event.results.length; ++i) {
         const result = event.results[i];
         if (!result) continue;
-        
-        const transcript = (result.transcript || result[0]?.transcript || '').trim();
+
+        const text = (result.transcript || result[0]?.transcript || '').trim();
+        if (!text) continue;
+
         if (result.isFinal) {
-          finalTranscript += transcript + ' ';
+          eventFinals.push(text);
         } else {
-          interimTranscript += transcript + ' ';
+          // Replace previous interim instead of appending
+          eventInterim = text;
         }
       }
     }
 
-    const fullText = (finalTranscript + interimTranscript).trim();
+    // Process new final segments and append non-overlapping parts
+    for (const nextFinal of eventFinals) {
+      const trimmed = this._trimOverlap(this.finalTranscript, nextFinal);
+      if (trimmed) {
+        this.finalTranscript = (this.finalTranscript + ' ' + trimmed).trim();
+      }
+    }
+
+    // Trim overlap from interim to prevent duplicate display text
+    const trimmedInterim = this._trimOverlap(this.finalTranscript, eventInterim);
+
+    // Construct final display transcript
+    const fullText = (this.finalTranscript + ' ' + trimmedInterim).trim();
     if (!fullText) return;
 
     this.lastTranscript = fullText;
+
+    // Log recognition events for debugging
+    console.log(
+      `EVENT: ${eventFinals.length > 0 ? 'final' : 'interim'}\n` +
+      `TEXT: ${eventFinals.length > 0 ? eventFinals.join(' | ') : eventInterim}\n\n` +
+      `Current Display:\n${fullText}\n`
+    );
 
     // Reset silence and pause timers since user is active
     if (this.silenceTimer) {
@@ -221,6 +270,8 @@ class VoiceService {
     this.onPartialResultCallback = onPartialResult;
 
     this.lastTranscript = '';
+    this.finalTranscript = '';
+    this.currentInterimTranscript = '';
     this.hasFinalized = false;
     this._clearTimers();
 
@@ -320,6 +371,8 @@ class VoiceService {
    */
   stopListening() {
     this._clearTimers();
+    this.finalTranscript = '';
+    this.currentInterimTranscript = '';
     if (Platform.OS === 'web') {
       if (this.recognition) {
         try {
