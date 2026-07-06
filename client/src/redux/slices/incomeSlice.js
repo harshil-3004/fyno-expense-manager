@@ -15,9 +15,10 @@ export const fetchIncomes = createAsyncThunk(
 
 export const createIncome = createAsyncThunk(
   'income/create',
-  async (data, { rejectWithValue }) => {
+  async (data, { dispatch, rejectWithValue }) => {
     try {
       const response = await incomeService.create(data);
+      dispatch(fetchIncomes({ sort: '-date', limit: 50 }));
       return response.data;
     } catch (error) {
       return rejectWithValue(error.response?.data?.message || 'Failed to create income');
@@ -27,9 +28,10 @@ export const createIncome = createAsyncThunk(
 
 export const updateIncome = createAsyncThunk(
   'income/update',
-  async ({ id, data }, { rejectWithValue }) => {
+  async ({ id, data }, { dispatch, rejectWithValue }) => {
     try {
       const response = await incomeService.update(id, data);
+      dispatch(fetchIncomes({ sort: '-date', limit: 50 }));
       return response.data;
     } catch (error) {
       return rejectWithValue(error.response?.data?.message || 'Failed to update income');
@@ -39,9 +41,10 @@ export const updateIncome = createAsyncThunk(
 
 export const deleteIncome = createAsyncThunk(
   'income/delete',
-  async (id, { rejectWithValue }) => {
+  async (id, { dispatch, rejectWithValue }) => {
     try {
       await incomeService.delete(id);
+      dispatch(fetchIncomes({ sort: '-date', limit: 50 }));
       return id;
     } catch (error) {
       return rejectWithValue(error.response?.data?.message || 'Failed to delete income');

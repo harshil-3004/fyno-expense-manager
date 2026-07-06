@@ -93,13 +93,13 @@ const getFynnHistory = asyncHandler(async (req, res) => {
 // @access  Private
 const chatFynn = asyncHandler(async (req, res) => {
   const userId = req.user._id;
-  const { message } = req.body;
+  const { message, requestId } = req.body;
 
   if (!message || message.trim() === '') {
     return res.status(400).json({ message: 'Message text is required' });
   }
 
-  const result = await fynnAIService.generateResponse(userId, message);
+  const result = await fynnAIService.generateResponse(userId, message, requestId);
   res.json(result);
 });
 
@@ -135,6 +135,28 @@ const clearFynnHistory = asyncHandler(async (req, res) => {
   res.json({ message: 'Conversation and state deleted successfully' });
 });
 
+// @desc    Check if a specific requestId has already been successfully processed
+// @route   GET /api/fynn/idempotency/:requestId
+// @access  Private
+const checkIdempotency = asyncHandler(async (req, res) => {
+  const userId = req.user._id;
+  const { requestId } = req.params;
+
+  const FynnIdempotency = require('../models/FynnIdempotency');
+  const cached = await FynnIdempotency.findOne({ userId, requestId });
+
+  if (cached && cached.status === 'completed') {
+    return res.json({
+      completed: true,
+      response: cached.response
+    });
+  }
+
+  res.json({
+    completed: false
+  });
+});
+
 module.exports = {
   getFynnSummary,
   getFynnSpending,
@@ -147,4 +169,5 @@ module.exports = {
   getWeeklyReview,
   getMonthlyReview,
   clearFynnHistory,
+  checkIdempotency,
 };

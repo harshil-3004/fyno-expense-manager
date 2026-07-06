@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const config = require('../../config');
 const User = require('../../models/User');
 const FynnConversation = require('../../models/FynnConversation');
@@ -9,6 +10,12 @@ const PromptBuilder = require('./PromptBuilder');
 const Expense = require('../../models/Expense');
 const Income = require('../../models/Income');
 const FynnState = require('../../models/FynnState');
+const FynnIdempotency = require('../../models/FynnIdempotency');
+
+const TransactionResolver = require('./TransactionResolver');
+const CrudExecutor = require('./CrudExecutor');
+const ConversationStateManager = require('./ConversationStateManager');
+const AiValidationLayer = require('./AiValidationLayer');
 
 const FALLBACK_CHAT_RESPONSE = "Sorry, Fynn is temporarily unavailable. We are working to restore services. Please check back in a little bit! 😊";
 
@@ -45,10 +52,12 @@ class FynnAIService {
   /**
    * Helper to write a single transaction document into MongoDB and verify it
    */
-  async _saveTransaction(userId, type, amount, category, description, confidence = 1.0) {
-    console.log('[INSERT STARTED]', { userId, type, amount, category, description });
+  async _saveTransaction(userId, type, amount, category, description, confidence = 1.0, date = null, session = null) {
+    console.log('[INSERT STARTED]', { userId, type, amount, category, description, date, hasSession: !!session });
     try {
       let savedDoc;
+      const saveOpts = session ? { session } : {};
+
       if (type === 'expense') {
         const validCategories = ['food', 'travel', 'shopping', 'bills', 'entertainment', 'health', 'education', 'other'];
         let normCategory = category.toLowerCase().trim();
@@ -57,7 +66,7 @@ class FynnAIService {
           normCategory = 'other';
         }
 
-        savedDoc = await Expense.create({
+        const expenseData = {
           userId,
           title: description,
           amount,
@@ -65,10 +74,17 @@ class FynnAIService {
           notes: `AI Categorized (Confidence: ${confidence})`,
           source: 'ai',
           confidence
-        });
+        };
+        if (date) {
+          expenseData.date = new Date(date);
+        }
+
+        const expense = new Expense(expenseData);
+        savedDoc = await expense.save(saveOpts);
+        console.log('[STAGE] Expense created: description="' + description + '", amount=' + amount);
 
         // Verification check: Read the inserted row back from the database
-        const verified = await Expense.findOne({ _id: savedDoc._id, userId });
+        const verified = await Expense.findOne({ _id: savedDoc._id, userId }).session(session ? session : null);
         if (!verified) {
           throw new Error("Transaction verification failed: row not found after insert");
         }
@@ -81,7 +97,7 @@ class FynnAIService {
           normCategory = 'Other';
         }
 
-        savedDoc = await Income.create({
+        const incomeData = {
           userId,
           sourceName: description,
           amount,
@@ -89,10 +105,17 @@ class FynnAIService {
           notes: `AI Categorized (Confidence: ${confidence})`,
           source: 'ai',
           confidence
-        });
+        };
+        if (date) {
+          incomeData.date = new Date(date);
+        }
+
+        const income = new Income(incomeData);
+        savedDoc = await income.save(saveOpts);
+        console.log('[STAGE] Income created: description="' + description + '", amount=' + amount);
 
         // Verification check: Read the inserted row back from the database
-        const verified = await Income.findOne({ _id: savedDoc._id, userId });
+        const verified = await Income.findOne({ _id: savedDoc._id, userId }).session(session ? session : null);
         if (!verified) {
           throw new Error("Transaction verification failed: row not found after insert");
         }
@@ -151,9 +174,18 @@ class FynnAIService {
       response: responseText
     });
 
+    const contextObj = await FinancialContextBuilder.buildContext(userId);
     return {
+      success: true,
+      message: responseText,
       response: responseText,
-      intent: 'ai_conversation'
+      intent: 'ai_conversation',
+      summary: {
+        monthlyIncome: contextObj.monthlyIncome,
+        monthlyExpense: contextObj.monthlyExpense,
+        savings: contextObj.savings,
+        streak: contextObj.streak
+      }
     };
   }
 
@@ -164,126 +196,609 @@ class FynnAIService {
    * @param {string} message 
    * @returns {Promise<object>}
    */
-  async generateResponse(userId, message) {
+  async generateResponse(userId, message, requestId = null) {
+    // 1. Structured logging of input
+    console.log('[STAGE] Request received: userId="' + userId + '", message="' + message + '", requestId="' + requestId + '"');
+
+    // 2. Check Idempotency Cache
+    if (requestId) {
+      try {
+        let cached = await FynnIdempotency.findOne({ userId, requestId });
+        if (cached) {
+          console.log(`[IDEMPOTENCY CACHE HIT] User ${userId}: requestId=${requestId}`);
+          if (cached.status === 'completed') {
+            const elapsedMs = Date.now() - new Date(cached.createdAt).getTime();
+            if (elapsedMs <= 120000) {
+              console.log(`[STAGE] Retry protection triggered: requestId="${requestId}" already completed within 2 minutes.`);
+              return {
+                response: "This request has already been completed.",
+                intent: cached.response.intent || 'transaction_added',
+                transactionIds: cached.transactionIds || [],
+                alreadyCompleted: true
+              };
+            }
+            return cached.response;
+          } else if (cached.status === 'processing') {
+            console.log(`[STAGE] Request is currently processing: requestId="${requestId}". Polling...`);
+            let pollCount = 0;
+            while (pollCount < 20) {
+              await new Promise(resolve => setTimeout(resolve, 250));
+              cached = await FynnIdempotency.findOne({ userId, requestId });
+              if (cached && cached.status === 'completed') {
+                console.log(`[IDEMPOTENCY CACHE HIT AFTER POLL] User ${userId}: requestId=${requestId}`);
+                const elapsedMs = Date.now() - new Date(cached.createdAt).getTime();
+                if (elapsedMs <= 120000) {
+                  return {
+                    response: "This request has already been completed.",
+                    intent: cached.response.intent || 'transaction_added',
+                    transactionIds: cached.transactionIds || [],
+                    alreadyCompleted: true
+                  };
+                }
+                return cached.response;
+              }
+              pollCount++;
+            }
+            return {
+              response: "This request is already being processed. Please wait.",
+              intent: 'error'
+            };
+          }
+        } else {
+          // Attempt to acquire lock
+          try {
+            await FynnIdempotency.create({
+              userId,
+              requestId,
+              status: 'processing',
+              response: { response: 'Processing...', intent: 'processing' }
+            });
+            console.log(`[STAGE] Idempotency lock acquired: requestId="${requestId}"`);
+          } catch (err) {
+            if (err.code === 11000) {
+              console.log(`[STAGE] Parallel request collision/lock active: requestId="${requestId}"`);
+              let pollCount = 0;
+              while (pollCount < 20) {
+                await new Promise(resolve => setTimeout(resolve, 250));
+                cached = await FynnIdempotency.findOne({ userId, requestId });
+                if (cached && cached.status === 'completed') {
+                  console.log(`[IDEMPOTENCY CACHE HIT AFTER LOCK] User ${userId}: requestId=${requestId}`);
+                  const elapsedMs = Date.now() - new Date(cached.createdAt).getTime();
+                  if (elapsedMs <= 120000) {
+                    return {
+                      response: "This request has already been completed.",
+                      intent: cached.response.intent || 'transaction_added',
+                      transactionIds: cached.transactionIds || [],
+                      alreadyCompleted: true
+                    };
+                  }
+                  return cached.response;
+                }
+                pollCount++;
+              }
+              return {
+                response: "This request is already being processed. Please wait.",
+                intent: 'error'
+              };
+            }
+            throw err;
+          }
+        }
+      } catch (err) {
+        console.error('Idempotency lookup/lock error:', err.message);
+      }
+    }
+
+    const saveToIdempotency = async (resBody, transactionIds = []) => {
+      if (requestId) {
+        try {
+          await FynnIdempotency.findOneAndUpdate(
+            { userId, requestId },
+            { 
+              response: resBody,
+              message: message,
+              status: 'completed',
+              transactionIds: transactionIds
+            },
+            { upsert: true, new: true }
+          );
+          console.log(`[IDEMPOTENCY CACHED] User ${userId}: requestId=${requestId}`);
+        } catch (err) {
+          console.error('Idempotency save error:', err.message);
+        }
+      }
+      console.log('[STAGE] Response sent: response="' + resBody.response + '"');
+      return resBody;
+    };
+
     try {
-      // 1. Check if Gemini key is present. If not, trigger immediate graceful fallback.
       if (!config.geminiApiKey) {
         console.warn('FynnAIService: Gemini API key is missing. Triggering graceful fallback.');
-        return {
+        return await saveToIdempotency({
           response: FALLBACK_CHAT_RESPONSE,
           intent: 'fallback'
-        };
+        });
       }
 
       const currencySymbol = await this._getCurrencySymbol(userId);
       const context = await FinancialContextBuilder.buildContext(userId);
-      const cleanMsg = message.toLowerCase().trim();
       const userIdStr = userId.toString();
-      // Retrieve conversation state for this user
+
+      // 3. Resolve Conversation State First (ConversationStateManager)
+      const pendingState = await ConversationStateManager.getState(userId);
+      if (pendingState) {
+        console.log('[STATE CHECK] Active pending state found:', pendingState.type);
+        const resolved = await ConversationStateManager.resolveInput(message, pendingState);
+
+        if (resolved.resolved) {
+          if (resolved.cancelled) {
+            await ConversationStateManager.clearState(userId);
+            return await saveToIdempotency({
+              response: "Operation cancelled. ❌",
+              intent: 'transaction_cancelled'
+            });
+          }
+
+          // Awaiting delete confirmation
+          if (pendingState.type === 'awaiting_delete_confirmation' && resolved.confirmed) {
+            const pendingData = pendingState.data;
+            await ConversationStateManager.clearState(userId);
+
+            if (pendingData.targetType === 'budget') {
+              const Budget = require('../../models/Budget');
+              const query = { userId };
+              if (pendingData.category) {
+                query.category = pendingData.category;
+              }
+              const res = await Budget.deleteMany(query);
+              
+              // Verify deletion
+              if (pendingData.category) {
+                const check = await Budget.findOne(query);
+                if (check) throw new Error("Verification failed: budget not deleted");
+              } else {
+                const check = await Budget.find({ userId });
+                if (check.length > 0) throw new Error("Verification failed: budgets not deleted");
+              }
+
+              FinancialContextBuilder.invalidateCache(userId);
+
+              const responseText = pendingData.category
+                ? `Successfully deleted your "${pendingData.category.charAt(0).toUpperCase() + pendingData.category.slice(1)}" budget.`
+                : `Successfully deleted all your budgets (${res.deletedCount} items).`;
+
+              const context = await FinancialContextBuilder.buildContext(userId);
+              return await saveToIdempotency({
+                success: true,
+                message: responseText,
+                response: responseText,
+                intent: 'transaction_deleted',
+                summary: {
+                  monthlyIncome: context.monthlyIncome,
+                  monthlyExpense: context.monthlyExpense,
+                  savings: context.savings,
+                  streak: context.streak
+                }
+              });
+            }
+
+            if (pendingData.targetType === 'reset_data') {
+              const resExp = await Expense.deleteMany({ userId });
+              const resInc = await Income.deleteMany({ userId });
+              const Budget = require('../../models/Budget');
+              const resBud = await Budget.deleteMany({ userId });
+              
+              // Verify
+              const checkExp = await Expense.findOne({ userId });
+              const checkInc = await Income.findOne({ userId });
+              const checkBud = await Budget.findOne({ userId });
+              if (checkExp || checkInc || checkBud) {
+                throw new Error("Verification failed: not all data was cleared from database");
+              }
+
+              await FynnState.deleteOne({ userId });
+              FinancialContextBuilder.invalidateCache(userId);
+
+              const responseText = `Successfully reset all your data. Deleted ${resExp.deletedCount} expenses, ${resInc.deletedCount} incomes, and ${resBud.deletedCount} budgets.`;
+
+              const context = await FinancialContextBuilder.buildContext(userId);
+              return await saveToIdempotency({
+                success: true,
+                message: responseText,
+                response: responseText,
+                intent: 'transaction_deleted',
+                summary: {
+                  monthlyIncome: context.monthlyIncome,
+                  monthlyExpense: context.monthlyExpense,
+                  savings: context.savings,
+                  streak: context.streak
+                }
+              });
+            }
+
+            // Default targetType: transactions
+            const matches = pendingData.matches;
+            let session;
+            let useTransaction = true;
+            try {
+              session = await mongoose.startSession();
+              session.startTransaction();
+            } catch (_) {
+              useTransaction = false;
+            }
+
+            try {
+              await CrudExecutor.delete(userId, matches, useTransaction ? session : null);
+              
+              // Verify deletion
+              const expenseIds = matches.filter(m => m.type === 'expense').map(m => m._id);
+              const incomeIds = matches.filter(m => m.type === 'income').map(m => m._id);
+              if (expenseIds.length > 0) {
+                const checkExp = await Expense.find({ _id: { $in: expenseIds }, userId }).session(useTransaction ? session : null);
+                if (checkExp.length > 0) throw new Error("Verification failed: deleted expenses still in DB");
+              }
+              if (incomeIds.length > 0) {
+                const checkInc = await Income.find({ _id: { $in: incomeIds }, userId }).session(useTransaction ? session : null);
+                if (checkInc.length > 0) throw new Error("Verification failed: deleted incomes still in DB");
+              }
+
+              if (useTransaction && session) await session.commitTransaction();
+
+              // Clear state and cache lastTransactionId if it was deleted
+              let fynnState = await FynnState.findOne({ userId });
+              if (fynnState) {
+                const deletedIdsStr = matches.map(d => d._id.toString());
+                if (fynnState.lastTransactionId && deletedIdsStr.includes(fynnState.lastTransactionId.toString())) {
+                  fynnState.lastTransactionId = undefined;
+                  fynnState.lastTransactionType = undefined;
+                  fynnState.lastAmount = undefined;
+                  fynnState.lastCategory = undefined;
+                  fynnState.lastDescription = undefined;
+                  await fynnState.save();
+                }
+              }
+
+              FinancialContextBuilder.invalidateCache(userId);
+
+              // Dynamically build success response based on actual deletion metrics
+              const deletedExpenses = matches.filter(m => m.type === 'expense').length;
+              const deletedIncomes = matches.filter(m => m.type === 'income').length;
+              
+              let responseText = "";
+              if (deletedExpenses > 0 && deletedIncomes > 0) {
+                responseText = `Successfully deleted ${deletedExpenses} expenses and ${deletedIncomes} incomes.`;
+              } else if (deletedExpenses > 0) {
+                responseText = deletedExpenses === 1 
+                  ? `Successfully deleted expense: "${matches[0].resolvedTitle}".`
+                  : `Successfully deleted ${deletedExpenses} expenses.`;
+              } else if (deletedIncomes > 0) {
+                responseText = deletedIncomes === 1 
+                  ? `Successfully deleted income: "${matches[0].resolvedTitle}".`
+                  : `Successfully deleted ${deletedIncomes} incomes.`;
+              } else {
+                responseText = "No transactions were deleted.";
+              }
+
+              const context = await FinancialContextBuilder.buildContext(userId);
+              return await saveToIdempotency({
+                success: true,
+                message: responseText,
+                response: responseText,
+                intent: 'transaction_deleted',
+                transactions: matches,
+                summary: {
+                  monthlyIncome: context.monthlyIncome,
+                  monthlyExpense: context.monthlyExpense,
+                  savings: context.savings,
+                  streak: context.streak
+                }
+              });
+            } catch (err) {
+              console.error('[ERROR] Name:', err.name);
+              console.error('[ERROR] Message:', err.message);
+              console.error('[ERROR] Stack trace:', err.stack);
+              console.error('[ERROR] Current stage: delete confirmation execution');
+
+              if (useTransaction && session) await session.abortTransaction();
+              return await saveToIdempotency({
+                response: `Error deleting transaction: ${err.message}`,
+                intent: 'error'
+              });
+            } finally {
+              if (session) session.endSession();
+            }
+          }
+
+          // Awaiting update confirmation
+          if (pendingState.type === 'awaiting_update_confirmation' && resolved.confirmed) {
+            const { matches, changes } = pendingState.data;
+            await ConversationStateManager.clearState(userId);
+
+            let session;
+            let useTransaction = true;
+            try {
+              session = await mongoose.startSession();
+              session.startTransaction();
+            } catch (_) {
+              useTransaction = false;
+            }
+
+            try {
+              const updated = await CrudExecutor.update(userId, matches, changes, useTransaction ? session : null);
+              
+              if (useTransaction && session) await session.commitTransaction();
+
+              if (updated.length > 0) {
+                const lastDoc = updated[updated.length - 1];
+                await FynnState.findOneAndUpdate(
+                  { userId },
+                  {
+                    lastTransactionId: lastDoc._id,
+                    lastTransactionType: lastDoc.type,
+                    lastAmount: lastDoc.amount,
+                    lastCategory: lastDoc.category,
+                    lastDescription: lastDoc.title || lastDoc.sourceName
+                  },
+                  { upsert: true }
+                );
+              }
+
+              FinancialContextBuilder.invalidateCache(userId);
+              const responseText = "Expense updated successfully.";
+              const context = await FinancialContextBuilder.buildContext(userId);
+              return await saveToIdempotency({
+                success: true,
+                message: responseText,
+                response: responseText,
+                intent: 'transaction_updated',
+                transactions: updated.map(u => u.toObject ? u.toObject() : u),
+                summary: {
+                  monthlyIncome: context.monthlyIncome,
+                  monthlyExpense: context.monthlyExpense,
+                  savings: context.savings,
+                  streak: context.streak
+                }
+              });
+            } catch (err) {
+              console.error('[ERROR] Name:', err.name);
+              console.error('[ERROR] Message:', err.message);
+              console.error('[ERROR] Stack trace:', err.stack);
+              console.error('[ERROR] Current stage: update confirmation execution');
+
+              if (useTransaction && session) await session.abortTransaction();
+              return await saveToIdempotency({
+                response: `Error updating transaction: ${err.message}`,
+                intent: 'error'
+              });
+            } finally {
+              if (session) session.endSession();
+            }
+          }
+
+          // Awaiting choice selection
+          if (pendingState.type === 'awaiting_transaction_selection' && resolved.value !== undefined) {
+            const selectedIdx = resolved.value;
+            const chosenMatch = pendingState.data.matches[selectedIdx];
+            const originalAction = pendingState.data.originalAction;
+
+            await ConversationStateManager.clearState(userId);
+
+            if (originalAction === 'delete_transactions') {
+              // Transition to awaiting delete confirmation for the chosen match
+              const formattedDate = new Date(chosenMatch.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+              const responseText = `⚠️ I found that ${chosenMatch.resolvedTitle} (${chosenMatch.category}) expense of ${currencySymbol}${chosenMatch.amount.toLocaleString()} on ${formattedDate}. Are you sure you want to delete it?`;
+              await ConversationStateManager.setState(userId, 'awaiting_delete_confirmation', {
+                matches: [chosenMatch],
+                response: responseText
+              });
+              return await saveToIdempotency({
+                response: responseText,
+                intent: 'clarification_needed'
+              });
+            }
+
+            if (originalAction === 'update_transactions') {
+              // Ask for confirmation to execute update
+              const changes = pendingState.data.changes;
+              let changeDetails = '';
+              if (changes.amount) changeDetails += ` amount to ${currencySymbol}${changes.amount}`;
+              if (changes.category) changeDetails += ` category to ${changes.category}`;
+              if (changes.description) changeDetails += ` description to "${changes.description}"`;
+
+              const responseText = `I found ${chosenMatch.resolvedTitle} for ${currencySymbol}${chosenMatch.amount}. Do you want to change its${changeDetails}?`;
+              await ConversationStateManager.setState(userId, 'awaiting_update_confirmation', {
+                matches: [chosenMatch],
+                changes,
+                response: responseText
+              });
+              return await saveToIdempotency({
+                response: responseText,
+                intent: 'clarification_needed'
+              });
+            }
+
+            if (originalAction === 'duplicate_transactions') {
+              // Duplicate directly
+              let session;
+              let useTransaction = true;
+              try {
+                session = await mongoose.startSession();
+                session.startTransaction();
+              } catch (_) {
+                useTransaction = false;
+              }
+
+              try {
+                const duplicated = await CrudExecutor.duplicate(userId, [chosenMatch], useTransaction ? session : null);
+                if (useTransaction && session) await session.commitTransaction();
+
+                if (duplicated.length > 0) {
+                  const lastDoc = duplicated[0];
+                  await FynnState.findOneAndUpdate(
+                    { userId },
+                    {
+                      lastTransactionId: lastDoc._id,
+                      lastTransactionType: lastDoc.type,
+                      lastAmount: lastDoc.amount,
+                      lastCategory: lastDoc.category,
+                      lastDescription: lastDoc.title || lastDoc.sourceName
+                    },
+                    { upsert: true }
+                  );
+                }
+
+                FinancialContextBuilder.invalidateCache(userId);
+                return await saveToIdempotency({
+                  response: "Expense duplicated successfully.",
+                  intent: 'transaction_added'
+                });
+              } catch (err) {
+                if (useTransaction && session) await session.abortTransaction();
+                return await saveToIdempotency({
+                  response: `Error duplicating transaction: ${err.message}`,
+                  intent: 'error'
+                });
+              } finally {
+                if (session) session.endSession();
+              }
+            }
+          }
+
+          // Awaiting amount
+          if (pendingState.type === 'awaiting_amount' && resolved.value !== undefined) {
+            const enteredAmount = resolved.value;
+            const partialData = pendingState.data.partialData;
+            await ConversationStateManager.clearState(userId);
+
+            let session;
+            let useTransaction = true;
+            try {
+              session = await mongoose.startSession();
+              session.startTransaction();
+            } catch (_) {
+              useTransaction = false;
+            }
+
+            try {
+              const doc = await this._saveTransaction(
+                userId,
+                partialData.type,
+                enteredAmount,
+                partialData.category,
+                partialData.description,
+                1.0,
+                partialData.date,
+                useTransaction ? session : null
+              );
+
+              if (useTransaction && session) await session.commitTransaction();
+
+              await FynnState.findOneAndUpdate(
+                { userId },
+                {
+                  lastTransactionId: doc._id,
+                  lastTransactionType: partialData.type,
+                  lastAmount: doc.amount,
+                  lastCategory: doc.category,
+                  lastDescription: doc.title || doc.sourceName
+                },
+                { upsert: true }
+              );
+
+              FinancialContextBuilder.invalidateCache(userId);
+
+              // Generate factual response
+              const responseText = `Done! Added ${currencySymbol}${doc.amount.toLocaleString()} under ${doc.category.charAt(0).toUpperCase() + doc.category.slice(1)} for "${doc.title || doc.sourceName}".`;
+              return await saveToIdempotency({
+                response: responseText,
+                intent: 'transaction_added'
+              });
+            } catch (err) {
+              if (useTransaction && session) await session.abortTransaction();
+              return await saveToIdempotency({
+                response: `Error saving transaction: ${err.message}`,
+                intent: 'error'
+              });
+            } finally {
+              if (session) session.endSession();
+            }
+          }
+
+          // Awaiting category
+          if (pendingState.type === 'awaiting_category' && resolved.value !== undefined) {
+            const enteredCategory = resolved.value;
+            const partialData = pendingState.data.partialData;
+            await ConversationStateManager.clearState(userId);
+
+            let session;
+            let useTransaction = true;
+            try {
+              session = await mongoose.startSession();
+              session.startTransaction();
+            } catch (_) {
+              useTransaction = false;
+            }
+
+            try {
+              const doc = await this._saveTransaction(
+                userId,
+                partialData.type,
+                partialData.amount,
+                enteredCategory,
+                partialData.description,
+                1.0,
+                partialData.date,
+                useTransaction ? session : null
+              );
+
+              if (useTransaction && session) await session.commitTransaction();
+
+              await FynnState.findOneAndUpdate(
+                { userId },
+                {
+                  lastTransactionId: doc._id,
+                  lastTransactionType: partialData.type,
+                  lastAmount: doc.amount,
+                  lastCategory: doc.category,
+                  lastDescription: doc.title || doc.sourceName
+                },
+                { upsert: true }
+              );
+
+              FinancialContextBuilder.invalidateCache(userId);
+
+              const responseText = `Done! Added ${currencySymbol}${doc.amount.toLocaleString()} under ${doc.category.charAt(0).toUpperCase() + doc.category.slice(1)} for "${doc.title || doc.sourceName}".`;
+              return await saveToIdempotency({
+                response: responseText,
+                intent: 'transaction_added'
+              });
+            } catch (err) {
+              if (useTransaction && session) await session.abortTransaction();
+              return await saveToIdempotency({
+                response: `Error saving transaction: ${err.message}`,
+                intent: 'error'
+              });
+            } finally {
+              if (session) session.endSession();
+            }
+          }
+        } else {
+          // Input did not resolve the state.
+          if (resolved.intent === 'conversation') {
+            console.log('[STATE CHECK] User message classified as conversation. Keeping pending state active.');
+          } else {
+            console.log('[STATE CHECK] Unrelated message sent. Clearing pending state.');
+            await ConversationStateManager.clearState(userId);
+          }
+        }
+      }
+
+      // 4. Standard Intent Extraction
       let fynnState = await FynnState.findOne({ userId });
       if (!fynnState) {
         fynnState = await FynnState.create({ userId });
       }
 
-      // 2. Check for Pending Low-Confidence Transaction Confirmation
-      const pending = pendingTransactions.get(userIdStr);
-      if (pending) {
-        const isConfirmOrCancel = cleanMsg === 'yes' || cleanMsg === 'no' || cleanMsg === 'cancel' || cleanMsg.includes('confirm');
-        
-        if (isConfirmOrCancel) {
-          if (cleanMsg === 'no' || cleanMsg === 'cancel') {
-            pendingTransactions.delete(userIdStr);
-            return {
-              response: "Transaction cancelled! ❌",
-              intent: 'transaction_cancelled'
-            };
-          }
-
-          // User clicked "Confirm Category" or said "yes"
-          let confirmedCategory = pending.originalCategory;
-          
-          // Check if user confirmed a specific category (e.g. "confirm food")
-          const confirmMatch = cleanMsg.match(/^confirm\s+(.+)$/);
-          if (confirmMatch) {
-            confirmedCategory = confirmMatch[1].trim();
-          }
-
-          // Save transaction to DB (which handles INSERT STARTED, INSERT SUCCESS, INSERT FAILED, and read-back verification)
-          let savedDoc;
-          try {
-            savedDoc = await this._saveTransaction(
-              userId,
-              pending.type,
-              pending.amount,
-              confirmedCategory,
-              pending.description,
-              pending.confidence
-            );
-          } catch (insertError) {
-            return {
-              response: `Error saving confirmed transaction: ${insertError.message}`,
-              intent: 'error'
-            };
-          }
-
-          // Clear cache, invalidate stats cache
-          pendingTransactions.delete(userIdStr);
-          FinancialContextBuilder.invalidateCache(userId);
-          console.log('[CACHE REFRESHED]');
-
-          // Update conversation state (FynnState)
-          await FynnState.findOneAndUpdate(
-            { userId },
-            {
-              lastTransactionId: savedDoc._id,
-              lastTransactionType: pending.type,
-              lastAmount: savedDoc.amount,
-              lastCategory: savedDoc.category,
-              lastDescription: savedDoc.title || savedDoc.sourceName
-            },
-            { upsert: true, new: true }
-          );
-          console.log('[DB VERIFIED]');
-
-          // Format response - try generating a friendly confirmation via AI
-          const details = [{
-            type: pending.type,
-            amount: pending.amount,
-            category: confirmedCategory,
-            description: pending.description
-          }];
-
-          let responseText;
-          try {
-            const confPrompt = PromptBuilder.getConfirmationResponsePrompt(message, 'create_transactions', details, currencySymbol);
-            const confSys = PromptBuilder.getConfirmationSystemInstruction();
-            responseText = await this.provider.generateChatResponse([
-              { role: 'user', parts: [{ text: confPrompt }] }
-            ], confSys);
-          } catch (err) {
-            console.warn('FynnAIService: Failed generating friendly confirm confirmation, using fallback.', err.message);
-            const capitalize = s => s.charAt(0).toUpperCase() + s.slice(1);
-            responseText = `${capitalize(pending.type)} Added Successfully:\n\n• Amount: ${currencySymbol}${pending.amount.toLocaleString()}\n• Category: ${capitalize(confirmedCategory)}\n• Description: ${pending.description}`;
-          }
-
-          await FynnConversation.create({
-            userId,
-            message,
-            intent: 'transaction_added',
-            response: responseText
-          });
-
-          return {
-            response: responseText,
-            intent: 'transaction_added'
-          };
-        } else {
-          // If the user ignored the confirmation and sent a new message, delete pending transaction
-          pendingTransactions.delete(userIdStr);
-        }
-      }
-
-      // 3. Analyze user message for Transaction Log or Update intent
       const lastTxInfo = fynnState.lastTransactionId ? {
         id: fynnState.lastTransactionId,
         type: fynnState.lastTransactionType,
@@ -292,67 +807,113 @@ class FynnAIService {
         description: fynnState.lastDescription
       } : null;
 
-      const parsePrompt = PromptBuilder.getTransactionParsingPrompt(message, lastTxInfo);
-      const parseSystemInstruction = PromptBuilder.getTransactionParsingSystemInstruction(lastTxInfo);
-      
+      const localTimeStr = new Date().toISOString();
+      const parsePrompt = PromptBuilder.getTransactionParsingPrompt(message, lastTxInfo, localTimeStr);
+      const parseSystemInstruction = PromptBuilder.getTransactionParsingSystemInstruction(lastTxInfo, localTimeStr);
+
+      console.log('[STAGE] AI parsing started');
       let parseResult;
       try {
         parseResult = await this.provider.generateStructuredResponse(parsePrompt, parseSystemInstruction);
-        console.log('[AI EXTRACTION]', JSON.stringify(parseResult));
+        console.log('[AI RAW RESPONSE]', JSON.stringify(parseResult));
+        console.log('[STAGE] AI parsing completed: action="' + parseResult.action + '"');
       } catch (err) {
-        console.warn('FynnAIService: Failed parsing transaction structure, continuing conversation... Error:', err.message);
+        console.warn('FynnAIService: Failed parsing transaction structure, continuing conversation...', err.message);
         parseResult = { action: 'none' };
+        console.log('[STAGE] AI parsing completed: action="none" (failed)');
       }
 
-      // 4. Handle Insertion Flow (create_transactions)
-      if (parseResult.action === 'create_transactions') {
-        const { transactions } = parseResult;
-        if (!Array.isArray(transactions) || transactions.length === 0) {
-          return {
-            response: "No valid transactions parsed. Please try again! 😊",
-            intent: 'error'
-          };
-        }
+      // 5. Validation Layer
+      console.log('[STAGE] Validation started');
+      const validation = AiValidationLayer.validate(parseResult);
+      if (!validation.isValid) {
+        console.warn('[VALIDATION FAILED]', validation.reason);
+        console.log('[STAGE] Validation failed: ' + validation.reason);
+        return await saveToIdempotency({
+          response: `Sorry, I couldn't understand that instruction: ${validation.reason}.`,
+          intent: 'error'
+        });
+      }
 
-        console.log('[ACTION CREATED]', JSON.stringify({ action: 'create_transactions', count: transactions.length }));
+      const validatedData = validation.data;
+      console.log('[VALIDATED OUTPUT]', JSON.stringify(validatedData));
+      console.log('[STAGE] Validation successful');
+
+      // 6. Execute Actions
+
+      // Incomplete Action
+      if (validatedData.action === 'incomplete') {
+        const { missingFields, partialData } = validatedData;
+        if (missingFields.includes('amount')) {
+          const responseText = `I see you logged a ${partialData.type} for "${partialData.description}". How much did you spend/earn?`;
+          await ConversationStateManager.setState(userId, 'awaiting_amount', { partialData, response: responseText });
+          return await saveToIdempotency({
+            response: responseText,
+            intent: 'clarification_needed'
+          });
+        }
+        if (missingFields.includes('category')) {
+          const responseText = `What category should I use for "${partialData.description}"?`;
+          await ConversationStateManager.setState(userId, 'awaiting_category', { partialData, response: responseText });
+          return await saveToIdempotency({
+            response: responseText,
+            intent: 'clarification_needed'
+          });
+        }
+      }
+
+      // Add Transactions
+      if (validatedData.action === 'create_transactions') {
+        const { transactions } = validatedData;
+
+        let session;
+        let useTransaction = true;
+        try {
+          session = await mongoose.startSession();
+          session.startTransaction();
+          console.log('[STAGE] DB Transaction started');
+        } catch (_) {
+          useTransaction = false;
+        }
 
         const insertedDocs = [];
         try {
           for (const tx of transactions) {
-            // Validation checks
-            if (typeof tx.amount !== 'number' || tx.amount <= 0 || !tx.type || !tx.category || !tx.description) {
-              throw new Error("Invalid transaction parameters: validation failed.");
-            }
-            if (tx.type !== 'expense' && tx.type !== 'income') {
-              throw new Error(`Unsupported transaction type: ${tx.type}`);
-            }
-
-            const doc = await this._saveTransaction(userId, tx.type, tx.amount, tx.category, tx.description);
+            const doc = await this._saveTransaction(
+              userId,
+              tx.type,
+              tx.amount,
+              tx.category,
+              tx.description,
+              1.0,
+              tx.date,
+              useTransaction ? session : null
+            );
             insertedDocs.push(doc);
           }
-        } catch (err) {
-          // Rollback: delete all successfully inserted transactions in this batch
-          for (const doc of insertedDocs) {
-            try {
-              if (doc.title !== undefined) {
-                await Expense.deleteOne({ _id: doc._id, userId });
-              } else {
-                await Income.deleteOne({ _id: doc._id, userId });
-              }
-            } catch (cleanupErr) {
-              console.error('Rollback cleanup failed for ID:', doc._id, cleanupErr.message);
-            }
+
+          if (useTransaction && session) {
+            await session.commitTransaction();
+            console.log('[STAGE] DB Transaction commit success');
           }
-          return {
+        } catch (err) {
+          console.error('[ERROR] Name:', err.name);
+          console.error('[ERROR] Message:', err.message);
+          console.error('[ERROR] Stack trace:', err.stack);
+          console.error('[ERROR] Current stage: create_transactions DB execution');
+
+          if (useTransaction && session) {
+            await session.abortTransaction();
+            console.log('[STAGE] DB Transaction rollback triggered: error="' + err.message + '"');
+          }
+          return await saveToIdempotency({
             response: `Error saving transactions: ${err.message}`,
             intent: 'error'
-          };
+          });
+        } finally {
+          if (session) session.endSession();
         }
 
-        // Database verified
-        console.log('[DB VERIFIED]');
-
-        // Update conversation state (FynnState) with the LAST transaction of the batch
         if (insertedDocs.length > 0) {
           const lastDoc = insertedDocs[insertedDocs.length - 1];
           const lastType = lastDoc.title !== undefined ? 'expense' : 'income';
@@ -365,15 +926,12 @@ class FynnAIService {
               lastCategory: lastDoc.category,
               lastDescription: lastDoc.title || lastDoc.sourceName
             },
-            { upsert: true, new: true }
+            { upsert: true }
           );
         }
 
-        // Invalidate stats cache
         FinancialContextBuilder.invalidateCache(userId);
-        console.log('[CACHE REFRESHED]');
 
-        // Return friendly response based on formatting guidelines and user context
         const details = insertedDocs.map(d => ({
           type: d.title !== undefined ? 'expense' : 'income',
           amount: d.amount,
@@ -389,176 +947,344 @@ class FynnAIService {
             { role: 'user', parts: [{ text: confPrompt }] }
           ], confSys);
         } catch (err) {
-          console.warn('FynnAIService: Failed generating friendly confirmation, using fallback.', err.message);
-          responseText = "✅ Transactions Added Successfully";
-          const hasExpenses = insertedDocs.some(d => d.title !== undefined);
-          const hasIncomes = insertedDocs.some(d => d.sourceName !== undefined);
-          if (hasExpenses && !hasIncomes) {
-            responseText = "✅ Expense Added Successfully";
-          } else if (hasIncomes && !hasExpenses) {
-            responseText = "✅ Income Added Successfully";
-          }
+          responseText = `Added transaction: ${details.map(d => `${d.description} (${currencySymbol}${d.amount})`).join(', ')}`;
         }
 
-        await FynnConversation.create({
-          userId,
-          message,
+        const context = await FinancialContextBuilder.buildContext(userId);
+        return await saveToIdempotency({
+          success: true,
+          message: responseText,
+          response: responseText,
           intent: 'transaction_added',
+          transactions: details,
+          summary: {
+            monthlyIncome: context.monthlyIncome,
+            monthlyExpense: context.monthlyExpense,
+            savings: context.savings,
+            streak: context.streak
+          }
+        }, insertedDocs.map(d => d._id));
+      }
+
+      // Update Transactions
+      if (validatedData.action === 'update_transactions') {
+        const { updates } = validatedData;
+        const updatesQueue = [];
+
+        for (const updateBlock of updates) {
+          const res = await TransactionResolver.resolve(userId, updateBlock.target, lastTxInfo, 'update_transactions');
+          if (res.status === 'empty') {
+            return await saveToIdempotency({
+              response: `Sorry, I couldn't find any transaction matching "${updateBlock.target?.description || 'that query'}".`,
+              intent: 'error'
+            });
+          }
+          if (res.status === 'ambiguous') {
+            const options = res.matches.map((m, idx) => {
+              const formattedDate = new Date(m.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+              const capCategory = m.category.charAt(0).toUpperCase() + m.category.slice(1);
+              return `${idx + 1}. ${m.resolvedTitle} (${capCategory}) - ${currencySymbol}${m.amount.toLocaleString()} on ${formattedDate}`;
+            }).join('\n');
+
+            const responseText = `I found multiple transactions matching "${updateBlock.target?.description}". Which one did you mean?\n\n${options}\n\nPlease reply with the number.`;
+
+            await ConversationStateManager.setState(userId, 'awaiting_transaction_selection', {
+              originalAction: 'update_transactions',
+              matches: res.matches,
+              changes: updateBlock.changes,
+              response: responseText
+            });
+
+            return await saveToIdempotency({
+              response: responseText,
+              intent: 'clarification_needed'
+            });
+          }
+
+          updatesQueue.push({ matches: res.matches, changes: updateBlock.changes });
+        }
+
+        // Require confirmation for updates
+        const targetMatch = updatesQueue[0].matches[0];
+        const changes = updatesQueue[0].changes;
+
+        let changeDetails = '';
+        if (changes.amount) changeDetails += ` amount to ${currencySymbol}${changes.amount}`;
+        if (changes.category) changeDetails += ` category to ${changes.category}`;
+        if (changes.description) changeDetails += ` description to "${changes.description}"`;
+
+        const responseText = `I found ${targetMatch.resolvedTitle} for ${currencySymbol}${targetMatch.amount}. Do you want to change its${changeDetails}?`;
+
+        await ConversationStateManager.setState(userId, 'awaiting_update_confirmation', {
+          matches: [targetMatch],
+          changes,
           response: responseText
         });
 
-        return {
+        return await saveToIdempotency({
           response: responseText,
-          intent: 'transaction_added'
-        };
+          intent: 'clarification_needed'
+        });
       }
 
-      // 5. Handle Update Flow
-      if (parseResult.action === 'update_transaction') {
-        const { field, value } = parseResult;
-        const lastTxId = fynnState.lastTransactionId;
-        const lastTxType = fynnState.lastTransactionType;
+      // Delete Transactions
+      if (validatedData.action === 'delete_transactions') {
+        const { deletes } = validatedData;
+        const allMatches = [];
 
-        if (!lastTxId) {
-          console.error('[UPDATE FAILED] No last transaction ID found in conversation state.');
-          return {
-            response: "Sorry, I couldn't update the transaction. Please try again.",
-            intent: 'error'
-          };
+        for (const deleteBlock of deletes) {
+          const res = await TransactionResolver.resolve(userId, deleteBlock, lastTxInfo, 'delete_transactions');
+          if (res.status === 'empty') {
+            return await saveToIdempotency({
+              response: `Sorry, I couldn't find any transaction matching "${deleteBlock.description || 'that query'}".`,
+              intent: 'error'
+            });
+          }
+          if (res.status === 'ambiguous') {
+            const options = res.matches.map((m, idx) => {
+              const formattedDate = new Date(m.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+              const capCategory = m.category.charAt(0).toUpperCase() + m.category.slice(1);
+              return `${idx + 1}. ${m.resolvedTitle} (${capCategory}) - ${currencySymbol}${m.amount.toLocaleString()} on ${formattedDate}`;
+            }).join('\n');
+
+            const responseText = `I found multiple transactions matching "${deleteBlock.description}". Which one did you mean?\n\n${options}\n\nPlease reply with the number.`;
+
+            await ConversationStateManager.setState(userId, 'awaiting_transaction_selection', {
+              originalAction: 'delete_transactions',
+              matches: res.matches,
+              response: responseText
+            });
+
+            return await saveToIdempotency({
+              response: responseText,
+              intent: 'clarification_needed'
+            });
+          }
+
+          // Scope verification to ensure type safety
+          for (const match of res.matches) {
+            if (deleteBlock.scope === 'expense' && match.type !== 'expense') {
+              return await saveToIdempotency({
+                response: `Critical Mismatch: Requested expense deletion but resolved an income transaction: "${match.resolvedTitle}".`,
+                intent: 'error'
+              });
+            }
+            if (deleteBlock.scope === 'income' && match.type !== 'income') {
+              return await saveToIdempotency({
+                response: `Critical Mismatch: Requested income deletion but resolved an expense transaction: "${match.resolvedTitle}".`,
+                intent: 'error'
+              });
+            }
+            if (!allMatches.some(m => m._id.toString() === match._id.toString())) {
+              allMatches.push(match);
+            }
+          }
         }
 
-        console.log('[ACTION CREATED]', JSON.stringify(parseResult));
-        console.log('[UPDATE STARTED]', { lastTransactionId: lastTxId.toString(), field, value });
-
-        try {
-          const updateFields = {};
-          if (field === 'amount') {
-            const numVal = Number(value);
-            if (isNaN(numVal) || numVal <= 0) {
-              throw new Error("Invalid amount value provided");
-            }
-            updateFields.amount = numVal;
-          } else if (field === 'category') {
-            let normCategory = value.trim();
-            if (lastTxType === 'expense') {
-              const validCategories = ['food', 'travel', 'shopping', 'bills', 'entertainment', 'health', 'education', 'other'];
-              normCategory = normCategory.toLowerCase();
-              if (!validCategories.includes(normCategory)) normCategory = 'other';
-            } else {
-              const validCategories = ['Salary', 'Investment', 'Transfer', 'Other'];
-              normCategory = normCategory.charAt(0).toUpperCase() + normCategory.slice(1).toLowerCase();
-              if (!validCategories.includes(normCategory)) normCategory = 'Other';
-            }
-            updateFields.category = normCategory;
-          } else if (field === 'description') {
-            if (lastTxType === 'expense') {
-              updateFields.title = value;
-            } else {
-              updateFields.sourceName = value;
-            }
-          } else {
-            throw new Error(`Unsupported update field: ${field}`);
-          }
-
-          let updateResult;
-          let verifiedDoc;
-          if (lastTxType === 'expense') {
-            updateResult = await Expense.updateOne({ _id: lastTxId, userId }, { $set: updateFields });
-            console.log('[UPDATE QUERY EXECUTED]', JSON.stringify(updateResult));
-            if (updateResult.matchedCount === 0) {
-              throw new Error("No rows matched the update query.");
-            }
-            verifiedDoc = await Expense.findOne({ _id: lastTxId, userId });
-          } else {
-            updateResult = await Income.updateOne({ _id: lastTxId, userId }, { $set: updateFields });
-            console.log('[UPDATE QUERY EXECUTED]', JSON.stringify(updateResult));
-            if (updateResult.matchedCount === 0) {
-              throw new Error("No rows matched the update query.");
-            }
-            verifiedDoc = await Income.findOne({ _id: lastTxId, userId });
-          }
-
-          // Strict verification checks
-          if (!verifiedDoc) {
-            throw new Error("Updated transaction was not found in the database after update verification.");
-          }
-
-          if (field === 'amount' && verifiedDoc.amount !== updateFields.amount) {
-            throw new Error("Amount field was not updated correctly in database.");
-          }
-          if (field === 'category' && verifiedDoc.category !== updateFields.category) {
-            throw new Error("Category field was not updated correctly in database.");
-          }
-          if (field === 'description' && (verifiedDoc.title || verifiedDoc.sourceName) !== value) {
-            throw new Error("Description field was not updated correctly in database.");
-          }
-
-          console.log('[UPDATE VERIFIED]', JSON.stringify(verifiedDoc));
-          console.log('[DB VERIFIED]');
-
-          // Update conversation state (FynnState)
-          fynnState.lastAmount = verifiedDoc.amount;
-          fynnState.lastCategory = verifiedDoc.category;
-          fynnState.lastDescription = verifiedDoc.title || verifiedDoc.sourceName;
-          await fynnState.save();
-
-          // Invalidate finance caches
-          FinancialContextBuilder.invalidateCache(userId);
-          console.log('[CACHE REFRESHED]');
-
-          // Return success response: Only after successful verification should the AI respond
-          const details = {
-            field,
-            value,
-            type: verifiedDoc.title !== undefined ? 'expense' : 'income',
-            amount: verifiedDoc.amount,
-            category: verifiedDoc.category,
-            description: verifiedDoc.title || verifiedDoc.sourceName
-          };
-
-          let responseText;
-          try {
-            const confPrompt = PromptBuilder.getConfirmationResponsePrompt(message, 'update_transaction', details, currencySymbol);
-            const confSys = PromptBuilder.getConfirmationSystemInstruction();
-            responseText = await this.provider.generateChatResponse([
-              { role: 'user', parts: [{ text: confPrompt }] }
-            ], confSys);
-          } catch (err) {
-            console.warn('FynnAIService: Failed generating friendly update confirmation, using fallback.', err.message);
-            const capitalize = s => s.charAt(0).toUpperCase() + s.slice(1);
-            responseText = `${capitalize(field)} updated successfully.`;
-          }
-
-          await FynnConversation.create({
-            userId,
-            message,
-            intent: 'transaction_updated',
-            response: responseText
+        if (allMatches.length === 0) {
+          return await saveToIdempotency({
+            response: "No matching transactions found to delete.",
+            intent: 'error'
           });
-
-          return {
-            response: responseText,
-            intent: 'transaction_updated'
-          };
-
-        } catch (error) {
-          console.error('[UPDATE FAILED]', error.message);
-          return {
-            response: "Sorry, I couldn't update the transaction. Please try again.",
-            intent: 'error'
-          };
         }
+
+        // Describe exactly what will be deleted
+        let responseText = "";
+        if (allMatches.length === 1) {
+          const match = allMatches[0];
+          const formattedDate = new Date(match.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+          const categoryText = match.category.charAt(0).toUpperCase() + match.category.slice(1);
+          responseText = `⚠️ I found a ${match.resolvedTitle} (${categoryText}) transaction of ${currencySymbol}${match.amount.toLocaleString()} on ${formattedDate}. Are you sure you want to delete it?`;
+        } else {
+          const options = allMatches.map((m, idx) => {
+            const formattedDate = new Date(m.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+            const capCategory = m.category.charAt(0).toUpperCase() + m.category.slice(1);
+            return `${idx + 1}. ${m.resolvedTitle} (${capCategory}) - ${currencySymbol}${m.amount.toLocaleString()} on ${formattedDate}`;
+          }).join('\n');
+          responseText = `⚠️ Are you sure you want to delete these ${allMatches.length} transactions?\n\n${options}\n\nThis action cannot be undone.`;
+        }
+
+        // Save all matches in pending delete state
+        await ConversationStateManager.setState(userId, 'awaiting_delete_confirmation', {
+          targetType: 'transactions',
+          matches: allMatches,
+          response: responseText
+        });
+
+        return await saveToIdempotency({
+          response: responseText,
+          intent: 'clarification_needed'
+        });
       }
 
-      // 6. Fallback: process as normal conversational message
-      return await this._generateNormalChatResponse(userId, message, currencySymbol, context);
+      // Duplicate Transactions
+      if (validatedData.action === 'duplicate_transactions') {
+        const { duplicates } = validatedData;
+        const duplicatesQueue = [];
+
+        for (const duplicateBlock of duplicates) {
+          const res = await TransactionResolver.resolve(userId, duplicateBlock, lastTxInfo, 'duplicate_transactions');
+          if (res.status === 'empty') {
+            return await saveToIdempotency({
+              response: `Sorry, I couldn't find any transaction matching "${duplicateBlock.description || 'that query'}".`,
+              intent: 'error'
+            });
+          }
+          if (res.status === 'ambiguous') {
+            const options = res.matches.map((m, idx) => {
+              const formattedDate = new Date(m.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+              const capCategory = m.category.charAt(0).toUpperCase() + m.category.slice(1);
+              return `${idx + 1}. ${m.resolvedTitle} (${capCategory}) - ${currencySymbol}${m.amount.toLocaleString()} on ${formattedDate}`;
+            }).join('\n');
+
+            const responseText = `I found multiple transactions matching "${duplicateBlock.description}". Which one did you mean?\n\n${options}\n\nPlease reply with the number.`;
+
+            await ConversationStateManager.setState(userId, 'awaiting_transaction_selection', {
+              originalAction: 'duplicate_transactions',
+              matches: res.matches,
+              response: responseText
+            });
+
+            return await saveToIdempotency({
+              response: responseText,
+              intent: 'clarification_needed'
+            });
+          }
+
+          duplicatesQueue.push({ matches: res.matches });
+        }
+
+        let session;
+        let useTransaction = true;
+        try {
+          session = await mongoose.startSession();
+          session.startTransaction();
+        } catch (_) {
+          useTransaction = false;
+        }
+
+        const allDuplicatedDocs = [];
+        try {
+          for (const queueItem of duplicatesQueue) {
+            const duplicated = await CrudExecutor.duplicate(userId, queueItem.matches, useTransaction ? session : null);
+            allDuplicatedDocs.push(...duplicated);
+          }
+
+          if (useTransaction && session) await session.commitTransaction();
+        } catch (err) {
+          if (useTransaction && session) await session.abortTransaction();
+          return await saveToIdempotency({
+            response: `Error duplicating transactions: ${err.message}`,
+            intent: 'error'
+          });
+        } finally {
+          if (session) session.endSession();
+        }
+
+        if (allDuplicatedDocs.length > 0) {
+          const lastDoc = allDuplicatedDocs[allDuplicatedDocs.length - 1];
+          await FynnState.findOneAndUpdate(
+            { userId },
+            {
+              lastTransactionId: lastDoc._id,
+              lastTransactionType: lastDoc.type,
+              lastAmount: lastDoc.amount,
+              lastCategory: lastDoc.category,
+              lastDescription: lastDoc.title || lastDoc.sourceName
+            },
+            { upsert: true }
+          );
+        }
+
+        const responseText = "Expense duplicated successfully.";
+        const context = await FinancialContextBuilder.buildContext(userId);
+        return await saveToIdempotency({
+          success: true,
+          message: responseText,
+          response: responseText,
+          intent: 'transaction_added',
+          transactions: allDuplicatedDocs.map(d => d.toObject ? d.toObject() : d),
+          summary: {
+            monthlyIncome: context.monthlyIncome,
+            monthlyExpense: context.monthlyExpense,
+            savings: context.savings,
+            streak: context.streak
+          }
+        }, allDuplicatedDocs.map(d => d._id));
+      }
+
+      // Delete Budget
+      if (validatedData.action === 'delete_budget') {
+        const { category } = validatedData;
+        const Budget = require('../../models/Budget');
+        const query = { userId };
+        if (category) {
+          query.category = category;
+        }
+        const matchingBudgets = await Budget.find(query).lean();
+        
+        if (matchingBudgets.length === 0) {
+          return await saveToIdempotency({
+            response: category 
+              ? `Sorry, I couldn't find any budget set for the category "${category}".`
+              : "You don't have any budgets set to delete.",
+            intent: 'error'
+          });
+        }
+
+        // Respond with confirmation prompt
+        const description = category 
+          ? `your monthly budget for "${category.charAt(0).toUpperCase() + category.slice(1)}"`
+          : `all your monthly budgets (${matchingBudgets.length} categories)`;
+
+        const responseText = `⚠️ Are you sure you want to delete ${description}? This action cannot be undone.`;
+
+        // Save pending action
+        await ConversationStateManager.setState(userId, 'awaiting_delete_confirmation', {
+          targetType: 'budget',
+          category: category,
+          response: responseText
+        });
+
+        return await saveToIdempotency({
+          response: responseText,
+          intent: 'clarification_needed'
+        });
+      }
+
+      // Reset Data
+      if (validatedData.action === 'reset_data') {
+        const responseText = "⚠️ WARNING: Are you sure you want to reset your account? This will permanently delete all your expenses, incomes, budget limits, and AI conversation logs. This action CANNOT be undone.";
+
+        // Save pending action
+        await ConversationStateManager.setState(userId, 'awaiting_delete_confirmation', {
+          targetType: 'reset_data',
+          response: responseText
+        });
+
+        // Respond with confirmation prompt
+        return await saveToIdempotency({
+          response: responseText,
+          intent: 'clarification_needed'
+        });
+      }
+
+      // 7. Fallback: process as normal conversational message
+      const normalResponse = await this._generateNormalChatResponse(userId, message, currencySymbol, context);
+      return await saveToIdempotency(normalResponse);
 
     } catch (error) {
       console.error('FynnAIService Error in chat transaction routing:', error);
-      return {
+      if (requestId) {
+        try {
+          const FynnIdempotency = require('../../models/FynnIdempotency');
+          await FynnIdempotency.deleteOne({ userId, requestId });
+        } catch (_) {}
+      }
+      return await saveToIdempotency({
         response: FALLBACK_CHAT_RESPONSE,
         intent: 'error'
-      };
+      });
     }
   }
 

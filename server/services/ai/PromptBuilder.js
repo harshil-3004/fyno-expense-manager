@@ -119,7 +119,7 @@ Return a JSON object conforming exactly to this schema:
   /**
    * System instruction for the transaction detection and categorization engine
    */
-  getTransactionParsingSystemInstruction(lastTransactionInfo = null) {
+  getTransactionParsingSystemInstruction(lastTransactionInfo = null, localTimeStr = '') {
     let instruction = `You are Fynn's transaction parsing system.
 Do not generate conversational responses or pretend database operations happened. Your only job is to analyze the user's message and determine their intent, returning a structured JSON object ONLY.
 Do not output any markdown code blocks (e.g. \`\`\`json) or extra text.
@@ -128,26 +128,85 @@ Supported Categories for expenses: Food, Travel, Shopping, Bills, Entertainment,
 Supported Categories for income: Salary, Investment, Transfer, Other.
 
 Rules:
-1. If the user is logging one or more financial transactions (e.g., "I spent 700 at zudio and 210 on petrol", "spent 100 on books"):
-   - Set "action" to "create_transactions".
-   - Extract "transactions" as a JSON array of objects. Each object must have:
-     - "type": "expense" or "income"
-     - "amount": positive number
-     - "category": mapped to one of the supported categories (e.g. "Shopping", "Food", "Travel". If they say "Transport", map to "Travel". If "Other Income", map to "Other")
-     - "description": clean short name/label (e.g. "Zudio", "Petrol", "Books")
+1. If the user is logging one or more financial transactions (e.g., "Add Petrol 200", "spent 700 at zudio and 210 on petrol", "spent 100 on books"):
+   - If they specify the amount and description:
+     - Set "action" to "create_transactions".
+     - Extract "transactions" as a JSON array of objects. Each object must have:
+       - "type": "expense" or "income"
+       - "amount": positive number
+       - "category": mapped to one of the supported categories (e.g. "Shopping", "Food", "Travel". If they say "Transport", map to "Travel". If "Other Income", map to "Other")
+       - "description": clean short name/label (e.g. "Zudio", "Petrol", "Books")
+       - "date": ISO format string (YYYY-MM-DD) resolved relative to the current local time if specified (e.g. "yesterday"), or null if not specified.
+   - If they specify logging a transaction but the amount is missing (e.g., "Add shopping", "I spent on petrol"):
+     - Do NOT invent or guess the amount. Set "action" to "incomplete".
+     - Include "missingFields": ["amount"]
+     - Include "partialData" object containing the extracted fields (type, category, description, date).
 
-2. If the user is requesting to update, edit, rename, or change the last transaction (e.g., "Change it to food", "Change category to travel", "Update label to service", "Edit amount to 500", "Rename to groceries"):
-   - Set "action" to "update_transaction".
-   - Set "transactionId" to the ID of the last transaction provided in the context below. If none is in context, set it to "last".
-   - Identify "field": "category" | "description" | "amount".
-   - Extract "value": the new value. (For category, map to a valid category string. For description, a string. For amount, a number).
+2. If the user is requesting to update, edit, rename, or change transaction(s) (e.g., "Rename Petrol to Fuel", "Rename all Food expenses to Transport Food"):
+   - Set "action" to "update_transactions".
+   - Extract "updates" as a JSON array of objects. Each object must have:
+     - "target": a target filter object with fields:
+       * "description": string (the transaction title to match, e.g. "Petrol") or null
+       * "amount": number (to match/disambiguate) or null
+       * "category": string (to match/disambiguate) or null
+       * "index": number (if they specify e.g. "4th expense", extract the number, e.g. 4) or null
+       * "dateFilter": "today" | "all" | null
+       * "last": boolean (true if they use pronoun references like "it", "that", "the last transaction") or null
+       * "all": boolean (true if they explicitly want to modify all matching items) or null
+       * "scope": "expense" | "income" | "all" | null
+       * "except": an object representing exclusion filters (or null if none):
+         - "description": string to exclude or null
+         - "amount": number to exclude or null
+         - "category": category string to exclude or null
+         - "type": "expense" | "income" to exclude or null
+         - "dateFilter": "today" to exclude or null
+     - "changes": the modifications:
+       * "description": new string title or null
+       * "amount": new number or null
+       * "category": new category string or null
 
-3. If it is neither (general chat, financial queries like "How am I doing financially?", greetings like "hi", or unrelated topics):
+3. If the user is requesting to delete, remove, or cancel transaction(s) (e.g., "Delete Petrol", "Delete Clothing and McD together", "Delete everything except Zudio"):
+   - Set "action" to "delete_transactions".
+   - Extract "deletes" as a JSON array of objects. Each object must have fields:
+     - "description": string (the transaction title to delete, e.g. "Fuel") or null
+     - "amount": number or null
+     - "category": string or null
+     - "index": number or null
+     - "dateFilter": "today" | "all" | null
+     - "last": boolean or null
+     - "all": boolean or null
+     - "scope": "expense" | "income" | "all" | null
+     - "except": an object representing exclusion filters (or null if none)
+
+4. If the user is requesting to duplicate, copy, clone, or repeat transaction(s) (e.g., "Duplicate Petrol expenses"):
+   - Set "action" to "duplicate_transactions".
+   - Extract "duplicates" as a JSON array of objects. Each object must have fields:
+     - "description": string (the transaction title to duplicate) or null
+     - "amount": number or null
+     - "category": string or null
+     - "index": number or null
+     - "dateFilter": "today" | "all" | null
+     - "last": boolean or null
+     - "all": boolean or null
+     - "scope": "expense" | "income" | "all" | null
+     - "except": an object representing exclusion filters (or null if none)
+
+5. If the user is requesting to delete, remove, or clear budget limit(s) (e.g., "delete food budget", "remove bills budget", "clear budget"):
+   - Set "action" to "delete_budget".
+   - Extract "category" as a string (e.g., "food", "bills") or set it to null if they want to delete all budgets.
+
+6. If the user is requesting to reset, wipe, clear, or delete their entire account, data, or all transactions (e.g., "reset data", "wipe all data", "delete all transactions", "clear my account"):
+   - Set "action" to "reset_data".
+
+7. If it is neither (general chat, financial queries, greetings like "hi", or unrelated topics):
    - Set "action" to "none".`;
 
+    if (localTimeStr) {
+      instruction += `\n\nThe user's current local time is: ${localTimeStr}. Use this to resolve relative date words like "yesterday", "today", "day before yesterday", etc., into absolute YYYY-MM-DD strings.`;
+    }
+
     if (lastTransactionInfo) {
-      instruction += `\n\nContext of the user's last transaction:
-- ID: ${lastTransactionInfo.id}
+      instruction += `\n\nContext of the user's last transaction (ONLY use this if they refer to it using pronouns like "it", "that", "the last one"):
 - Type: ${lastTransactionInfo.type}
 - Amount: ${lastTransactionInfo.amount}
 - Category: ${lastTransactionInfo.category}
@@ -160,41 +219,102 @@ Rules:
   /**
    * Prompt to parse a transaction message
    */
-  getTransactionParsingPrompt(message, lastTransactionInfo = null) {
-    let prompt = `Analyze the following message and extract the transaction details or update request if applicable:
+  getTransactionParsingPrompt(message, lastTransactionInfo = null, localTimeStr = '') {
+    let prompt = `Analyze the following message and extract the transaction details, update requests, delete requests, or duplication requests if applicable:
 "${message}"
 
-Expected Schema for creating transactions (single or multiple):
+Expected Schema for creating transactions (action: "create_transactions"):
 {
   "action": "create_transactions",
   "transactions": [
+    { "type": "expense", "amount": 700, "category": "Shopping", "description": "Zudio", "date": "2026-06-29" }
+  ]
+}
+
+Expected Schema for incomplete transactions (missing amount or details) (action: "incomplete"):
+{
+  "action": "incomplete",
+  "missingFields": ["amount"],
+  "partialData": { "type": "expense", "category": "Shopping", "description": "zudio", "date": null }
+}
+
+Expected Schema for updating transactions (action: "update_transactions"):
+{
+  "action": "update_transactions",
+  "updates": [
     {
-      "type": "expense",
-      "amount": 700,
-      "category": "Shopping",
-      "description": "Zudio"
-    },
-    {
-      "type": "expense",
-      "amount": 210,
-      "category": "Travel",
-      "description": "Petrol"
+      "target": {
+        "description": "Petrol",
+        "amount": null,
+        "category": null,
+        "index": null,
+        "dateFilter": null,
+        "last": null,
+        "all": null,
+        "scope": "expense",
+        "except": null
+      },
+      "changes": { "description": "Fuel", "amount": null, "category": null }
     }
   ]
 }
 
-Expected Schema for updating a transaction:
+Expected Schema for deleting transactions (action: "delete_transactions"):
 {
-  "action": "update_transaction",
-  "transactionId": "${lastTransactionInfo ? lastTransactionInfo.id : '<last_transaction_id>'}",
-  "field": "category",
-  "value": "Food"
+  "action": "delete_transactions",
+  "deletes": [
+    {
+      "description": "Fuel",
+      "amount": null,
+      "category": null,
+      "index": null,
+      "dateFilter": null,
+      "last": null,
+      "all": null,
+      "scope": "expense",
+      "except": null
+    }
+  ]
+}
+
+Expected Schema for duplicating transactions (action: "duplicate_transactions"):
+{
+  "action": "duplicate_transactions",
+  "duplicates": [
+    {
+      "description": "Petrol",
+      "amount": null,
+      "category": null,
+      "index": null,
+      "dateFilter": null,
+      "last": null,
+      "all": null,
+      "scope": "expense",
+      "except": null
+    }
+  ]
+}
+
+Expected Schema for deleting budgets (action: "delete_budget"):
+{
+  "action": "delete_budget",
+  "category": "food" // or null for all budgets
+}
+
+Expected Schema for resetting all data (action: "reset_data"):
+{
+  "action": "reset_data"
 }
 
 Expected Schema for general messages:
 {
   "action": "none"
 }`;
+
+    if (localTimeStr) {
+      prompt += `\n\nReference local time for date calculations: ${localTimeStr}`;
+    }
+
     return prompt;
   }
 

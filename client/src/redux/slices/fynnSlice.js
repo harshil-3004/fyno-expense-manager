@@ -61,10 +61,36 @@ export const fetchFynnSummary = createAsyncThunk(
 
 export const sendChatMessage = createAsyncThunk(
   'fynn/sendChatMessage',
-  async (messageText, { rejectWithValue }) => {
+  async (payload, { rejectWithValue }) => {
     try {
-      const response = await fynnService.chat(messageText);
+      const messageText = typeof payload === 'string' ? payload : payload.messageText;
+      const requestId = typeof payload === 'object' ? payload.requestId : undefined;
+      const response = await fynnService.chat(messageText, requestId);
       return response.data; // { response, intent }
+    } catch (error) {
+      return rejectWithValue(error.response?.data?.message || 'Failed to send message');
+    }
+  }
+);
+
+export const retryChatMessage = createAsyncThunk(
+  'fynn/retryChatMessage',
+  async (payload, { rejectWithValue }) => {
+    try {
+      const messageText = payload.messageText;
+      const requestId = payload.requestId;
+
+      // 1. Ask backend if it is already completed
+      const checkRes = await fynnService.checkIdempotency(requestId);
+      if (checkRes.data && checkRes.data.completed) {
+        // Yes, it was already completed!
+        // Return the original response as-is!
+        return checkRes.data.response;
+      }
+
+      // 2. Otherwise, if not completed, we can safely resend
+      const response = await fynnService.chat(messageText, requestId);
+      return response.data;
     } catch (error) {
       return rejectWithValue(error.response?.data?.message || 'Failed to send message');
     }
@@ -180,12 +206,15 @@ const fynnSlice = createSlice({
         state.typing = true;
         state.error = null;
         state.suggestions = [];
+        const messageText = typeof action.meta.arg === 'string' ? action.meta.arg : action.meta.arg.messageText;
+        const requestId = typeof action.meta.arg === 'object' ? action.meta.arg.requestId : undefined;
         // Append user message to list instantly
         state.messages.push({
           id: `user_pending_${Date.now()}`,
-          text: action.meta.arg,
+          text: messageText,
           sender: 'user',
           timestamp: Date.now(),
+          requestId: requestId,
         });
       })
       .addCase(sendChatMessage.fulfilled, (state, action) => {
@@ -200,6 +229,36 @@ const fynnSlice = createSlice({
         });
       })
       .addCase(sendChatMessage.rejected, (state, action) => {
+        state.typing = false;
+        state.error = action.payload;
+        state.suggestions = [];
+        // Add error indicator bubble
+        state.messages.push({
+          id: `fynn_error_${Date.now()}`,
+          text: `Sorry, I had trouble connecting. Please try again! ⚠️`,
+          sender: 'fynn',
+          timestamp: Date.now(),
+        });
+      })
+
+      // Retry Chat Message
+      .addCase(retryChatMessage.pending, (state) => {
+        state.typing = true;
+        state.error = null;
+        state.suggestions = [];
+      })
+      .addCase(retryChatMessage.fulfilled, (state, action) => {
+        state.typing = false;
+        state.suggestions = action.payload.suggestions || [];
+        // Append Fynn response
+        state.messages.push({
+          id: `fynn_res_${Date.now()}`,
+          text: action.payload.response,
+          sender: 'fynn',
+          timestamp: Date.now(),
+        });
+      })
+      .addCase(retryChatMessage.rejected, (state, action) => {
         state.typing = false;
         state.error = action.payload;
         state.suggestions = [];

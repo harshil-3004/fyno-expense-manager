@@ -30,7 +30,7 @@ class GeminiProvider extends AIProvider {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(postData)
         },
-        timeout: 10000 // 10 seconds timeout
+        timeout: 30000 // 30 seconds timeout
       };
 
       const req = https.request(url, options, (res) => {
@@ -107,6 +107,7 @@ class GeminiProvider extends AIProvider {
 
         const responseText = response.candidates?.[0]?.content?.parts?.[0]?.text;
         if (responseText) {
+          await new Promise(resolve => setTimeout(resolve, 1500));
           return responseText;
         }
       } catch (err) {
@@ -152,6 +153,7 @@ class GeminiProvider extends AIProvider {
 
         const responseText = response.candidates?.[0]?.content?.parts?.[0]?.text;
         if (responseText) {
+          await new Promise(resolve => setTimeout(resolve, 1500));
           return JSON.parse(responseText);
         }
       } catch (err) {

@@ -12,6 +12,7 @@ const {
   getWeeklyReview,
   getMonthlyReview,
   clearFynnHistory,
+  checkIdempotency,
 } = require('../controllers/fynnController');
 
 /**
@@ -29,6 +30,7 @@ router.get('/history', protect, getFynnHistory);
 router.delete('/history', protect, clearFynnHistory);
 router.get('/review/weekly', protect, getWeeklyReview);
 router.get('/review/monthly', protect, getMonthlyReview);
+router.get('/idempotency/:requestId', protect, checkIdempotency);
 router.post('/chat', protect, chatFynn);
 
 module.exports = router;

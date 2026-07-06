@@ -10,6 +10,7 @@ import {
   StyleSheet,
   Keyboard,
   ActivityIndicator,
+  Alert,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -22,6 +23,7 @@ import {
   fetchFynnSummary,
   sendChatMessage,
   clearChatHistory,
+  retryChatMessage,
 } from '../../redux/slices/fynnSlice';
 import { fetchExpenses } from '../../redux/slices/expenseSlice';
 import { fetchIncomes } from '../../redux/slices/incomeSlice';
@@ -32,6 +34,8 @@ import FynnTypingIndicator from '../../components/fynn/FynnTypingIndicator';
 import FynnSuggestionChips from '../../components/fynn/FynnSuggestionChips';
 import InsightCards from '../../components/fynn/InsightCards';
 import ProactiveInsights from '../../components/fynn/ProactiveInsights';
+import VoiceAssistantOverlay from '../../components/fynn/VoiceAssistantOverlay';
+import VoiceService from '../../services/VoiceService';
 
 /**
  * Fynn Chat Screen
@@ -48,6 +52,7 @@ const FynnChatScreen = () => {
   const { messages, insights, summary, loading, typing, suggestions } = useSelector((state) => state.fynn);
   const { streak } = useSelector((state) => state.dashboard);
   const [inputText, setInputText] = useState('');
+  const [voiceOverlayVisible, setVoiceOverlayVisible] = useState(false);
 
   // Fetch initial chat data
   useEffect(() => {
@@ -83,11 +88,26 @@ const FynnChatScreen = () => {
       setInputText('');
       Keyboard.dismiss();
 
+      // Generate UUID request ID
+      const generateUUID = () => {
+        return 'text-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+          const r = (Math.random() * 16) | 0;
+          const v = c === 'x' ? r : (r & 0x3) | 0x8;
+          return v.toString(16);
+        });
+      };
+      const requestId = generateUUID();
+
       // Dispatch to backend API
-      const resultAction = await dispatch(sendChatMessage(messageText));
+      const resultAction = await dispatch(sendChatMessage({ messageText, requestId }));
       if (sendChatMessage.fulfilled.match(resultAction)) {
         const payload = resultAction.payload;
-        if (payload && (payload.intent === 'transaction_added' || payload.intent === 'transaction_updated')) {
+        if (payload && (
+          payload.intent === 'transaction_added' || 
+          payload.intent === 'transaction_updated' ||
+          payload.intent === 'transaction_deleted' ||
+          payload.intent === 'transaction_cancelled'
+        )) {
           dispatch(fetchExpenses({ sort: '-date', limit: 50 }));
           dispatch(fetchIncomes({ sort: '-date', limit: 50 }));
           dispatch(fetchFynnSummary());
@@ -95,6 +115,28 @@ const FynnChatScreen = () => {
       }
     },
     [dispatch, inputText]
+  );
+
+  const handleSendVoiceMessage = useCallback(
+    async (voiceText, requestId) => {
+      const resultAction = await dispatch(sendChatMessage({ messageText: voiceText, requestId }));
+      if (sendChatMessage.fulfilled.match(resultAction)) {
+        const payload = resultAction.payload;
+        if (payload && (
+          payload.intent === 'transaction_added' || 
+          payload.intent === 'transaction_updated' ||
+          payload.intent === 'transaction_deleted' ||
+          payload.intent === 'transaction_cancelled'
+        )) {
+          dispatch(fetchExpenses({ sort: '-date', limit: 50 }));
+          dispatch(fetchIncomes({ sort: '-date', limit: 50 }));
+          dispatch(fetchFynnSummary());
+        }
+        return payload;
+      }
+      throw new Error('Failed to send voice message');
+    },
+    [dispatch]
   );
 
   const handleSuggestionPress = useCallback(
@@ -302,6 +344,31 @@ const FynnChatScreen = () => {
           </View>
         </View>
         <View style={styles.headerRight}>
+          <Pressable
+            onPress={() => {
+              if (VoiceService.isSupported()) {
+                setVoiceOverlayVisible(true);
+              } else {
+                Alert.alert(
+                  'Voice Assistant Unavailable',
+                  'Voice features are not supported in standard Expo Go because they require a custom native module.\n\nUse a development client (`npx expo run:android` or `npx expo run:ios`) or run the application on Web to test voice functionality.',
+                  [{ text: 'OK' }]
+                );
+              }
+            }}
+            style={({ pressed }) => [
+              styles.headerButton,
+              {
+                opacity: pressed ? 0.6 : 1,
+                backgroundColor: colors.accent + '20',
+                borderRadius: borderRadius.sm,
+                marginRight: 8,
+              },
+            ]}
+            hitSlop={8}
+          >
+            <Ionicons name="mic-outline" size={18} color={colors.accentDark} />
+          </Pressable>
           {messages.length > 0 && (
             <Pressable
               onPress={handleClear}
@@ -347,7 +414,36 @@ const FynnChatScreen = () => {
                 {typing && <FynnTypingIndicator />}
                 {!typing && hasError && lastUserMsg && (
                   <Pressable
-                    onPress={() => dispatch(sendChatMessage(lastUserMsg))}
+                    onPress={async () => {
+                      const lastUserMsgObj = [...messages].reverse().find(m => m.sender === 'user');
+                      if (lastUserMsgObj) {
+                        const generateUUID = () => {
+                          return 'text-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+                            const r = (Math.random() * 16) | 0;
+                            const v = c === 'x' ? r : (r & 0x3) | 0x8;
+                            return v.toString(16);
+                          });
+                        };
+                        const reqId = lastUserMsgObj.requestId || generateUUID();
+                        const resultAction = await dispatch(retryChatMessage({
+                          messageText: lastUserMsgObj.text,
+                          requestId: reqId
+                        }));
+                        if (retryChatMessage.fulfilled.match(resultAction)) {
+                          const payload = resultAction.payload;
+                          if (payload && (
+                            payload.intent === 'transaction_added' || 
+                            payload.intent === 'transaction_updated' ||
+                            payload.intent === 'transaction_deleted' ||
+                            payload.intent === 'transaction_cancelled'
+                          )) {
+                            dispatch(fetchExpenses({ sort: '-date', limit: 50 }));
+                            dispatch(fetchIncomes({ sort: '-date', limit: 50 }));
+                            dispatch(fetchFynnSummary());
+                          }
+                        }
+                      }
+                    }}
                     style={({ pressed }) => [
                       styles.retryBubbleButton,
                       {
@@ -408,40 +504,46 @@ const FynnChatScreen = () => {
               style={[
                 styles.input,
                 {
-                  color: colors.textPrimary,
+                  color: typing ? colors.textMuted : colors.textPrimary,
                   fontFamily: fontFamily.regular,
                   fontSize: fontSize.sm,
                 },
               ]}
-              placeholder="Ask Fynn anything..."
+              placeholder={typing ? "Fynn is typing..." : "Ask Fynn anything..."}
               placeholderTextColor={colors.textMuted}
               value={inputText}
               onChangeText={setInputText}
               onSubmitEditing={() => handleSend()}
               returnKeyType="send"
               multiline={false}
+              editable={!typing}
             />
           </View>
           <Pressable
             onPress={() => handleSend()}
-            disabled={!inputText.trim()}
+            disabled={!inputText.trim() || typing}
             style={({ pressed }) => [
               styles.sendButton,
               {
-                backgroundColor: inputText.trim() ? colors.accent : colors.accent + '40',
+                backgroundColor: (inputText.trim() && !typing) ? colors.accent : colors.accent + '40',
                 borderRadius: borderRadius.full,
-                transform: [{ scale: pressed && inputText.trim() ? 0.9 : 1 }],
+                transform: [{ scale: pressed && inputText.trim() && !typing ? 0.9 : 1 }],
               },
             ]}
           >
             <Ionicons
               name="arrow-up"
               size={20}
-              color={inputText.trim() ? '#1A1A2E' : colors.textMuted}
+              color={(inputText.trim() && !typing) ? '#1A1A2E' : colors.textMuted}
             />
           </Pressable>
         </View>
       </KeyboardAvoidingView>
+      <VoiceAssistantOverlay
+        visible={voiceOverlayVisible}
+        onClose={() => setVoiceOverlayVisible(false)}
+        onSendVoiceMessage={handleSendVoiceMessage}
+      />
     </View>
   );
 };

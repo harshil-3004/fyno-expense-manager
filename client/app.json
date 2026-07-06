@@ -7,7 +7,11 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Allow Fyno to use the microphone for voice commands.",
+        "NSSpeechRecognitionUsageDescription": "Allow Fyno to perform speech recognition for logging expenses."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -15,7 +19,11 @@
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
-      }
+      },
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ],
+      "package": "com.anonymous.client"
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -23,7 +31,19 @@
     "plugins": [
       "expo-font",
       "expo-splash-screen",
-      "expo-asset"
-    ]
+      "expo-asset",
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Allow Fyno to use the microphone for voice commands.",
+          "speechRecognitionPermission": "Allow Fyno to perform speech recognition for logging expenses."
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "a10fca99-8242-46a4-9742-94fff4560c28"
+      }
+    }
   }
 }

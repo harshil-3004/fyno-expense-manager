@@ -13,9 +13,10 @@ const fynnService = {
   getInsights: () => api.get('/fynn/insights'),
   getHistory: () => api.get('/fynn/history'),
   clearHistory: () => api.delete('/fynn/history'),
-  chat: (message) => api.post('/fynn/chat', { message }),
+  chat: (message, requestId) => api.post('/fynn/chat', { message, requestId }),
   getWeeklyReview: () => api.get('/fynn/review/weekly'),
   getMonthlyReview: () => api.get('/fynn/review/monthly'),
+  checkIdempotency: (requestId) => api.get(`/fynn/idempotency/${requestId}`),
 };
 
 export default fynnService;

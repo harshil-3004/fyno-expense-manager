@@ -15,9 +15,10 @@ export const fetchExpenses = createAsyncThunk(
 
 export const createExpense = createAsyncThunk(
   'expenses/create',
-  async (data, { rejectWithValue }) => {
+  async (data, { dispatch, rejectWithValue }) => {
     try {
       const response = await expenseService.create(data);
+      dispatch(fetchExpenses({ sort: '-date', limit: 50 }));
       return response.data;
     } catch (error) {
       return rejectWithValue(error.response?.data?.message || 'Failed to create expense');
@@ -27,9 +28,10 @@ export const createExpense = createAsyncThunk(
 
 export const updateExpense = createAsyncThunk(
   'expenses/update',
-  async ({ id, data }, { rejectWithValue }) => {
+  async ({ id, data }, { dispatch, rejectWithValue }) => {
     try {
       const response = await expenseService.update(id, data);
+      dispatch(fetchExpenses({ sort: '-date', limit: 50 }));
       return response.data;
     } catch (error) {
       return rejectWithValue(error.response?.data?.message || 'Failed to update expense');
@@ -39,9 +41,10 @@ export const updateExpense = createAsyncThunk(
 
 export const deleteExpense = createAsyncThunk(
   'expenses/delete',
-  async (id, { rejectWithValue }) => {
+  async (id, { dispatch, rejectWithValue }) => {
     try {
       await expenseService.delete(id);
+      dispatch(fetchExpenses({ sort: '-date', limit: 50 }));
       return id;
     } catch (error) {
       return rejectWithValue(error.response?.data?.message || 'Failed to delete expense');

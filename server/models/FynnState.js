@@ -30,6 +30,20 @@ const fynnStateSchema = new mongoose.Schema(
       type: String,
       required: false,
     },
+    pendingAction: {
+      type: {
+        type: String, // 'awaiting_delete_confirmation', 'awaiting_update_confirmation', 'awaiting_transaction_selection', 'awaiting_amount', 'awaiting_category'
+        required: false
+      },
+      data: {
+        type: mongoose.Schema.Types.Mixed,
+        required: false
+      },
+      expiresAt: {
+        type: Date,
+        required: false
+      }
+    }
   },
   {
     timestamps: true,

@@ -2,11 +2,11 @@ import axios from 'axios';
 import storage from '../utils/storage';
 
 // Change this to your server URL
-const BASE_URL = 'http://192.168.1.4:5000/api';
+const BASE_URL = 'http://10.61.50.198:5000/api';
 
 const api = axios.create({
   baseURL: BASE_URL,
-  timeout: 15000,
+  timeout: 45000,
   headers: {
     'Content-Type': 'application/json',
   },
