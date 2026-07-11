@@ -5,8 +5,7 @@ import { useSelector } from 'react-redux';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import Button from '../../components/ui/Button';
-import DatePicker from 'react-native-modern-datepicker';
-import { Modal } from 'react-native';
+import { TextInput } from 'react-native';
 import { exportTransactions } from '../../services/export/ExportOrchestrator';
 import { formatCurrency } from '../../utils/formatCurrency';
 import { formatProperDate } from '../../utils/formatDate';
@@ -205,60 +204,48 @@ const ExportScreen = ({ route, navigation }) => {
       {dateRange === 'custom' && (
         <View style={styles.customDateContainer}>
           <View style={{ flex: 1, marginRight: spacing.sm }}>
-            <Text style={{ color: colors.textSecondary, marginBottom: spacing.xs }}>Start Date</Text>
-            <Button variant="outline" title={formatProperDate(customStart)} onPress={() => setShowStartPicker(true)} />
-            <Modal visible={showStartPicker} transparent animationType="slide">
-              <View style={{ flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.5)' }}>
-                <View style={{ backgroundColor: colors.surface, padding: 20, borderTopLeftRadius: 20, borderTopRightRadius: 20 }}>
-                  <DatePicker
-                    mode="calendar"
-                    selected={toYYYYMMDD(customStart)}
-                    onSelectedChange={date => {
-                      const [y, m, d] = date.split('/');
-                      setCustomStart(new Date(y, m - 1, d));
-                      setShowStartPicker(false);
-                    }}
-                    options={{
-                      backgroundColor: colors.surface,
-                      textHeaderColor: colors.textPrimary,
-                      textDefaultColor: colors.textPrimary,
-                      selectedTextColor: '#fff',
-                      mainColor: colors.accent,
-                      textSecondaryColor: colors.textSecondary,
-                    }}
-                  />
-                  <Button title="Close" variant="outline" onPress={() => setShowStartPicker(false)} />
-                </View>
-              </View>
-            </Modal>
+            <Text style={{ color: colors.textSecondary, marginBottom: spacing.xs }}>Start Date (YYYY-MM-DD)</Text>
+            <TextInput
+              style={{
+                borderWidth: 1,
+                borderColor: colors.border,
+                borderRadius: 8,
+                padding: 12,
+                color: colors.textPrimary,
+                fontFamily: typography.body.fontFamily,
+              }}
+              placeholder="2024-01-01"
+              placeholderTextColor={colors.textMuted}
+              value={toYYYYMMDD(customStart).replace(/\//g, '-')}
+              onChangeText={(text) => {
+                if (text.length === 10) {
+                  const [y, m, d] = text.split('-');
+                  setCustomStart(new Date(y, m - 1, d));
+                }
+              }}
+            />
           </View>
           <View style={{ flex: 1, marginLeft: spacing.sm }}>
-            <Text style={{ color: colors.textSecondary, marginBottom: spacing.xs }}>End Date</Text>
-            <Button variant="outline" title={formatProperDate(customEnd)} onPress={() => setShowEndPicker(true)} />
-            <Modal visible={showEndPicker} transparent animationType="slide">
-              <View style={{ flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.5)' }}>
-                <View style={{ backgroundColor: colors.surface, padding: 20, borderTopLeftRadius: 20, borderTopRightRadius: 20 }}>
-                  <DatePicker
-                    mode="calendar"
-                    selected={toYYYYMMDD(customEnd)}
-                    onSelectedChange={date => {
-                      const [y, m, d] = date.split('/');
-                      setCustomEnd(new Date(y, m - 1, d));
-                      setShowEndPicker(false);
-                    }}
-                    options={{
-                      backgroundColor: colors.surface,
-                      textHeaderColor: colors.textPrimary,
-                      textDefaultColor: colors.textPrimary,
-                      selectedTextColor: '#fff',
-                      mainColor: colors.accent,
-                      textSecondaryColor: colors.textSecondary,
-                    }}
-                  />
-                  <Button title="Close" variant="outline" onPress={() => setShowEndPicker(false)} />
-                </View>
-              </View>
-            </Modal>
+            <Text style={{ color: colors.textSecondary, marginBottom: spacing.xs }}>End Date (YYYY-MM-DD)</Text>
+            <TextInput
+              style={{
+                borderWidth: 1,
+                borderColor: colors.border,
+                borderRadius: 8,
+                padding: 12,
+                color: colors.textPrimary,
+                fontFamily: typography.body.fontFamily,
+              }}
+              placeholder="2024-12-31"
+              placeholderTextColor={colors.textMuted}
+              value={toYYYYMMDD(customEnd).replace(/\//g, '-')}
+              onChangeText={(text) => {
+                if (text.length === 10) {
+                  const [y, m, d] = text.split('-');
+                  setCustomEnd(new Date(y, m - 1, d));
+                }
+              }}
+            />
           </View>
         </View>
       )}
@@ -292,7 +279,7 @@ const ExportScreen = ({ route, navigation }) => {
       </View>
 
       <View style={{ flexDirection: 'row', marginTop: spacing.xl, gap: spacing.md }}>
-        <Button title="Back" variant="outline" onPress={() => setStep(1)} style={{ flex: 1 }} />
+        <Button title="Back" variant="secondary" onPress={() => setStep(1)} style={{ flex: 1 }} />
         <Button title="Next Step" onPress={() => setStep(3)} style={{ flex: 1 }} />
       </View>
     </View>
@@ -330,7 +317,7 @@ const ExportScreen = ({ route, navigation }) => {
       })}
 
       <View style={{ flexDirection: 'row', marginTop: spacing.xl, gap: spacing.md }}>
-        <Button title="Back" variant="outline" onPress={() => setStep(2)} style={{ flex: 1 }} />
+        <Button title="Back" variant="secondary" onPress={() => setStep(2)} style={{ flex: 1 }} />
         <Button title="Next Step" onPress={() => setStep(4)} style={{ flex: 1 }} />
       </View>
     </View>
@@ -367,7 +354,7 @@ const ExportScreen = ({ route, navigation }) => {
       </View>
 
       <View style={{ flexDirection: 'row', marginTop: spacing.xl, gap: spacing.md }}>
-        <Button title="Back" variant="outline" onPress={() => setStep(3)} style={{ flex: 1 }} disabled={isExporting} />
+        <Button title="Back" variant="secondary" onPress={() => setStep(3)} style={{ flex: 1 }} disabled={isExporting} />
         <Button title="Generate Export" onPress={handleExport} style={{ flex: 2 }} loading={isExporting} />
       </View>
     </View>

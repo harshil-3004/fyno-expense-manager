@@ -1,4 +1,4 @@
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import { generateCSV } from './generators/csvGenerator';
 import { generatePDF } from './generators/pdfGenerator';
@@ -15,7 +15,7 @@ export const exportTransactions = async (transactions, format, summary, options,
       fileUri = FileSystem.cacheDirectory + filename;
       
       await FileSystem.writeAsStringAsync(fileUri, csvString, {
-        encoding: FileSystem.EncodingType.UTF8,
+        encoding: 'utf8',
       });
     } else if (format === 'pdf') {
       fileUri = await generatePDF(transactions, summary, options, currency);
